@@ -48,10 +48,15 @@ class Maya1Model:
         print(f"Initializing Maya1 Model")
         print(f"Model: {model_path}")
         
+        trust_remote_code=True
+        if './' in model_path:
+            # local path
+            trust_remote_code=False
+
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
         )
         
         print(f"Tokenizer loaded: {len(self.tokenizer)} tokens")
@@ -71,7 +76,7 @@ class Maya1Model:
             max_model_len=max_model_len,
             gpu_memory_utilization=gpu_memory_utilization,
             tensor_parallel_size=tensor_parallel_size,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
             disable_log_stats=False,
             **engine_kwargs
         )

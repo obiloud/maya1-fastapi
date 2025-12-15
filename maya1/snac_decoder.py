@@ -3,6 +3,7 @@ import numpy as np
 import asyncio
 from typing import List, Optional, Tuple
 from snac import SNAC
+import os
 
 from .constants import (
     CODE_END_TOKEN_ID,
@@ -45,8 +46,10 @@ class SNACDecoder:
         self.max_batch_size = max_batch_size
         self.batch_timeout_ms = batch_timeout_ms
         
+        snack_model = os.environ.get('SNAC_MODEL_PATH', SNAC_MODEL_NAME)
+
         print(f"Loading SNAC 24kHz model to {device}...")
-        self.snac_model = SNAC.from_pretrained(SNAC_MODEL_NAME).eval().to(device)
+        self.snac_model = SNAC.from_pretrained(snack_model).eval().to(device)
         
         if compile_decoder:
             print(f"Compiling SNAC decoder with torch.compile...")

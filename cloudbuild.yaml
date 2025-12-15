@@ -1,0 +1,26 @@
+timeout: "3600s"
+steps:
+# Build the image
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['build', '-t', 'europe-west1-docker.pkg.dev/api-project-434000853810/mindfulness/maya1-fastapi:latest', '.']
+# Push the image to Artifact Registry
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['push', 'europe-west1-docker.pkg.dev/api-project-434000853810/mindfulness/maya1-fastapi:latest']
+# Deploy image to Cloud Run
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  entrypoint: gcloud
+  args: ['run', 'deploy', 'maya1-tts', 
+    '--image', 'europe-west1-docker.pkg.dev/api-project-434000853810/mindfulness/maya1-fastapi:latest', 
+    '--region', 'europe-west1',
+    '--memory', '16Gi', 
+    '--cpu', '8',
+    '--gpu', '1',
+    '--gpu-type', 'nvidia-l4',
+    '--no-cpu-throttling',
+    '--max-instances', '1',
+    '--port', '8000',
+    '--allow-unauthenticated',
+    '--set-env-vars', 'MAYA1_MODEL_PATH=./local_model,SNAC_MODEL_PATH=./local_snac'
+  ]
+images:
+- 'europe-west1-docker.pkg.dev/api-project-434000853810/mindfulness/maya1-fastapi:latest'

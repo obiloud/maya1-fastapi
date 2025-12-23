@@ -18,7 +18,7 @@ steps:
     '--gpu-type', 'nvidia-l4',
     '--no-cpu-throttling',
     '--min-instances', '0',
-    '--max-instances', '1',
+    '--max-instances', '2',
     '--port', '8000',
     '--allow-unauthenticated',
     '--set-env-vars', 'MAYA1_MODEL_PATH=./local_model,SNAC_MODEL_PATH=./local_snac,PYTORCH_ALLOC_CONF=expandable_segments:True'

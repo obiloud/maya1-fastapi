@@ -21,7 +21,7 @@ steps:
     '--max-instances', '2',
     '--port', '8000',
     '--allow-unauthenticated',
-    '--set-env-vars', 'MAYA1_MODEL_PATH=./local_model,SNAC_MODEL_PATH=./local_snac,PYTORCH_ALLOC_CONF=expandable_segments:True'
+    '--set-env-vars', 'MAYA1_MODEL_PATH=./local_model,SNAC_MODEL_PATH=./local_snac,PYTORCH_ALLOC_CONF=expandable_segments:True,SNAC_DEVICE=cpu'
   ]
 images:
 - 'europe-west1-docker.pkg.dev/api-project-434000853810/mindfulness/maya1-fastapi:latest'

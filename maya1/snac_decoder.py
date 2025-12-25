@@ -50,7 +50,14 @@ class SNACDecoder:
 
         print(f"Loading SNAC 24kHz model to {device}...")
         self.snac_model = SNAC.from_pretrained(snack_model).eval().to(device)
-        
+
+        if device == "cpu":
+            torch.set_num_threads(8)
+            torch.set_grad_enabled(False)
+
+            if hasattr(torch, 'set_flush_denormal'):
+                torch.set_flush_denormal(True)
+            
         if compile_decoder:
             print(f"Compiling SNAC decoder with torch.compile...")
             self._compile_model()

@@ -71,7 +71,9 @@ async def startup_event():
     prompt_builder = Maya1PromptBuilder(model.tokenizer, model)
     
     # Initialize SNAC decoder
-    snac_decoder = SNACDecoder(enable_batching=True, max_batch_size=64, batch_timeout_ms=15)
+    snac_device = os.environ.get('SNAC_DEVICE', "cuda")
+
+    snac_decoder = SNACDecoder(device=snac_device, enable_batching=True, max_batch_size=64, batch_timeout_ms=15)
     await snac_decoder.start_batch_processor()
     
     # Initialize pipelines

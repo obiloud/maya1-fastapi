@@ -20,6 +20,8 @@ from .constants import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_REPETITION_PENALTY,
     AUDIO_SAMPLE_RATE,
+    SNAC_BATCH_SIZE,
+    SNAC_BATCH_TIMEOUT_MS
 )
 
 # Timeout settings (seconds)
@@ -71,9 +73,9 @@ async def startup_event():
     prompt_builder = Maya1PromptBuilder(model.tokenizer, model)
     
     # Initialize SNAC decoder
-    snac_device = os.environ.get('SNAC_DEVICE', "cuda")
+    snac_device = os.environ.get("SNAC_DEVICE", "cuda")
 
-    snac_decoder = SNACDecoder(device=snac_device, enable_batching=True, max_batch_size=64, batch_timeout_ms=15)
+    snac_decoder = SNACDecoder(device=snac_device, enable_batching=True, max_batch_size=SNAC_BATCH_SIZE, batch_timeout_ms=SNAC_BATCH_TIMEOUT_MS)
     await snac_decoder.start_batch_processor()
     
     # Initialize pipelines

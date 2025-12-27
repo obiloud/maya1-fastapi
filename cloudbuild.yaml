@@ -2,7 +2,14 @@ timeout: "3600s"
 steps:
 # Build the image
 - name: 'gcr.io/cloud-builders/docker'
-  args: ['build', '-t', 'europe-west1-docker.pkg.dev/api-project-434000853810/mindfulness/maya1-fastapi:latest', '.']
+  args: ['build', 
+        '-t', 
+        'europe-west1-docker.pkg.dev/api-project-434000853810/mindfulness/maya1-fastapi:latest', 
+        '--cache-from', 
+        'europe-west1-docker.pkg.dev/api-project-434000853810/mindfulness/maya1-fastapi:latest', 
+        '--build-arg', 
+        'HF_TOKEN=${_HF_TOKEN}',
+        '.']
 # Push the image to Artifact Registry
 - name: 'gcr.io/cloud-builders/docker'
   args: ['push', 'europe-west1-docker.pkg.dev/api-project-434000853810/mindfulness/maya1-fastapi:latest']
@@ -25,3 +32,6 @@ steps:
   ]
 images:
 - 'europe-west1-docker.pkg.dev/api-project-434000853810/mindfulness/maya1-fastapi:latest'
+
+substitutions:
+  _HF_TOKEN: ""

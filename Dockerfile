@@ -6,6 +6,9 @@ WORKDIR /models
 RUN pip install --no-cache-dir huggingface-hub hf_transfer
 ENV HF_HUB_ENABLE_HF_TRANSFER=1
 
+ARG HF_TOKEN
+ENV HF_TOKEN=$HF_TOKEN
+
 # Download both models in one stage to simplify
 RUN hf download maya-research/maya1 --local-dir ./maya1
 RUN hf download hubertsiuzdak/snac_24khz --local-dir ./snac

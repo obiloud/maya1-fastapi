@@ -72,12 +72,15 @@ class Maya1Model:
         engine_args = AsyncEngineArgs(
             model=model_path,
             tokenizer=model_path,
+            quantization="fp8",
+            kv_cache_dtype="fp8",
             dtype=dtype,
             max_model_len=max_model_len,
             gpu_memory_utilization=gpu_memory_utilization,
             tensor_parallel_size=tensor_parallel_size,
             trust_remote_code=trust_remote_code,
             disable_log_stats=False,
+            max_num_seqs=1,
             enable_prefix_caching=True,
             **engine_kwargs
         )

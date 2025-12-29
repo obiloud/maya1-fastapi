@@ -8,27 +8,101 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+import asyncio
+import sys
+import logging
+import multiprocessing as mp
+from contextlib import asynccontextmanager
 
+from .logging import start_logging_listener
 from .model_loader import Maya1Model
 from .prompt_builder import Maya1PromptBuilder
-from .snac_decoder import SNACDecoder
-from .pipeline import Maya1Pipeline
-from .streaming_pipeline import Maya1SlidingWindowPipeline
+from .long_form_streaming_pipeline import Maya1SlidingWindowPipeline
 from .constants import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     DEFAULT_MAX_TOKENS,
     DEFAULT_REPETITION_PENALTY,
     AUDIO_SAMPLE_RATE,
-    SNAC_BATCH_SIZE,
-    SNAC_BATCH_TIMEOUT_MS
 )
 
 # Timeout settings (seconds)
 GENERATE_TIMEOUT = 60
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+logger = logging.getLogger("api_v2")
+
 # Load environment variables
 load_dotenv()
+
+if sys.platform != "win32":
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        # Method might already be set
+        pass
+
+# Global state
+model = None
+prompt_builder = None
+streaming_pipeline = None
+
+
+# ============================================================================
+# Startup/Shutdown
+# ============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI): # FIXED TYPO: lifspan -> lifespan
+    global model, prompt_builder, streaming_pipeline
+    
+    # 1. Initialize Multiprocessing Context first
+    ctx = mp.get_context('spawn')
+    log_queue = ctx.Queue()
+    
+    # Start Logging Listener
+    log_listener = start_logging_listener(log_queue)
+    log_listener.start()
+
+    logger.info("\n" + "="*60 + "\n Starting Maya1 TTS API Server\n" + "="*60)
+    
+    # Load Model (vLLM Engine)
+    # Ensure Maya1Model sets gpu_memory_utilization=0.8 inside its __init__
+    model = Maya1Model() 
+    prompt_builder = Maya1PromptBuilder(model.tokenizer, model)
+    
+    # Initialize the Streaming Pipeline
+    # This spawns the AsyncSNACProcess correctly within the lifespan
+    streaming_pipeline = Maya1SlidingWindowPipeline(model, prompt_builder, log_queue)
+
+    # BLOCK until ready
+    logger.info("Waiting for SNAC Decoder to warm up...")
+    max_wait = 30 # seconds
+    start_wait = time.time()
+    
+    while not streaming_pipeline.ready_event.is_set():
+        if time.time() - start_wait > max_wait:
+            logger.error("❌ SNAC Decoder failed to signal ready. Check child logs!")
+            break
+        await asyncio.sleep(0.5)
+    
+    if streaming_pipeline.ready_event.is_set():
+        logger.info("🚀 System fully initialized and ready for requests.")
+
+    yield
+
+    # Cleanup
+    logger.info("Shutting down...")
+    if streaming_pipeline:
+        # Sentinel to stop child process
+        streaming_pipeline.token_q.put(None) 
+        streaming_pipeline.decoder_proc.join(timeout=5)
+    
+    if log_listener:
+        log_queue.put(None)
+        log_listener.stop()
+
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -37,6 +111,7 @@ app = FastAPI(
     version="1.0.0",
     docs_url=None,
     redoc_url=None,
+    lifespan=lifespan
 )
 
 app.add_middleware(
@@ -46,54 +121,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Global state
-model = None
-prompt_builder = None
-snac_decoder = None
-pipeline = None
-streaming_pipeline = None
-
-
-# ============================================================================
-# Startup/Shutdown
-# ============================================================================
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize model on startup."""
-    global model, prompt_builder, snac_decoder, pipeline, streaming_pipeline
-    
-    print("\n" + "="*60)
-    print(" Starting Maya1 TTS API Server")
-    print("="*60 + "\n")
-    
-    # Initialize components
-    model = Maya1Model()
-    prompt_builder = Maya1PromptBuilder(model.tokenizer, model)
-    
-    # Initialize SNAC decoder
-    snac_device = os.environ.get("SNAC_DEVICE", "cuda")
-
-    snac_decoder = SNACDecoder(device=snac_device, enable_batching=True, max_batch_size=SNAC_BATCH_SIZE, batch_timeout_ms=SNAC_BATCH_TIMEOUT_MS)
-    await snac_decoder.start_batch_processor()
-    
-    # Initialize pipelines
-    pipeline = Maya1Pipeline(model, prompt_builder, snac_decoder)
-    streaming_pipeline = Maya1SlidingWindowPipeline(model, prompt_builder, snac_decoder)
-    
-    print("\n" + "="*60)
-    print("Maya1 TTS API Server Ready")
-    print("="*60 + "\n")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown."""
-    print("\nShutting down Maya1 TTS API Server")
-    
-    if snac_decoder and snac_decoder.is_running:
-        await snac_decoder.stop_batch_processor()
 
 
 # ============================================================================
@@ -231,109 +258,92 @@ async def generate_tts(request: TTSRequest):
     except HTTPException:
         raise
     except Exception as e:
-        print(f" Error: {e}")
+        logger.error(f" Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def _generate_tts_complete(
-    description: str,
-    text: str,
-    temperature: float,
-    top_p: float,
-    max_tokens: int,
-    repetition_penalty: float,
-    seed: Optional[int],
-):
-    """Generate complete WAV file (non-streaming)."""
-    
+async def _generate_tts_complete(description, text, **kwargs):
+    """
+    Refactored to use the streaming pipeline logic for consistency,
+    but collects all chunks before returning.
+    """
     try:
-        import asyncio
-        
-        # Generate audio
-        audio_bytes = await asyncio.wait_for(
-            pipeline.generate_speech(
-                description=description,
-                text=text,
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-                repetition_penalty=repetition_penalty,
-                seed=seed,
-            ),
-            timeout=GENERATE_TIMEOUT
+        audio_segments = []
+        # Use the same generator logic to ensure identical quality
+        stream = streaming_pipeline.generate_speech_stream(
+            description=description,
+            text=text,
+            **kwargs
         )
         
-        if audio_bytes is None:
-            raise Exception("Audio generation failed")
+        async for chunk in stream:
+            audio_segments.append(chunk)
+            
+        full_audio = b"".join(audio_segments)
         
-        # Create WAV file
         wav_buffer = io.BytesIO()
         with wave.open(wav_buffer, 'wb') as wav_file:
             wav_file.setnchannels(1)
             wav_file.setsampwidth(2)
             wav_file.setframerate(AUDIO_SAMPLE_RATE)
-            wav_file.writeframes(audio_bytes)
+            wav_file.writeframes(full_audio)
         
         wav_buffer.seek(0)
-        
-        return StreamingResponse(
-            wav_buffer,
-            media_type="audio/wav",
-            headers={"Content-Disposition": "attachment; filename=output.wav"}
-        )
-    
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Generation timeout")
+        return StreamingResponse(wav_buffer, media_type="audio/wav")
+    except Exception as e:
+        logger.error(f"Complete generation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-async def _generate_tts_streaming(
-    description: str,
-    text: str,
-    temperature: float,
-    top_p: float,
-    max_tokens: int,
-    repetition_penalty: float,
-    seed: Optional[int],
-):
-    """Generate streaming audio."""
-    start_time = time.time()
-    first_audio_time = None
-    
+async def _generate_tts_streaming(description, text, **kwargs):
+    """Generate streaming audio with Digital Silence heartbeats to keep connection alive."""    
     async def audio_stream_generator():
-        """Generate audio stream with WAV header."""
-        nonlocal first_audio_time
+        yield create_wav_header(sample_rate=AUDIO_SAMPLE_RATE)
+
+        start_time = None
+        total_samples_yielded = 0
         
-        # Send WAV header first
-        yield create_wav_header(sample_rate=AUDIO_SAMPLE_RATE, channels=1, bits_per_sample=16)
-        
-        # Stream audio chunks
-        async for audio_chunk in streaming_pipeline.generate_speech_stream(
-            description=description,
-            text=text,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            repetition_penalty=repetition_penalty,
-            seed=seed,
-        ):
-            if first_audio_time is None:
-                first_audio_time = time.time()
-                ttfb_ms = (first_audio_time - start_time) * 1000
-                print(f"⏱️  TTFB: {ttfb_ms:.1f}ms")
+        # 20ms of silence in bytes (24000 samples/sec * 0.02 sec * 2 bytes per sample)
+        silence_chunk = b'\x00' * int(AUDIO_SAMPLE_RATE * 0.02 * 2)
+        silence_samples = len(silence_chunk) // 2
+
+        # Convert the pipeline generator to an iterator we can manually poll
+        stream_iter = streaming_pipeline.generate_speech_stream(
+            description=description, text=text, **kwargs
+        ).__aiter__()
+
+        while True:
+            try:
+                # Wait up to 15 seconds for the next real audio chunk
+                audio_chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=15.0)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                # HEARTBEAT TRIGGERED: Send silence to keep the socket open
+                logger.info("💓 Heartbeat: Sending silence to keep Cloud Run alive...")
+                total_samples_yielded += silence_samples
+                yield silence_chunk
+                continue
+
+            # --- Normal Pacing Logic ---
+            num_samples = len(audio_chunk) // 2
+            
+            if start_time is None:
+                start_time = time.time()
+                total_samples_yielded += num_samples
+                yield audio_chunk
+                continue
+            
+            total_samples_yielded += num_samples
+            elapsed = time.time() - start_time
+            expected = total_samples_yielded / AUDIO_SAMPLE_RATE
+            
+            if expected > elapsed:
+                await asyncio.sleep(expected - elapsed)
             
             yield audio_chunk
     
-    try:
-        return StreamingResponse(
-            audio_stream_generator(),
-            media_type="audio/wav",
-            headers={"Cache-Control": "no-cache"}
-        )
-    
-    except Exception as e:
-        print(f"Streaming error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
+    return StreamingResponse(audio_stream_generator(), media_type="audio/wav")
 
 # For running directly
 if __name__ == "__main__":

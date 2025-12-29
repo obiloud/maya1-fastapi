@@ -4,20 +4,21 @@ steps:
 - name: 'gcr.io/cloud-builders/docker'
   args: ['build', 
         '-t', 
-        'europe-west1-docker.pkg.dev/api-project-434000853810/mindfulness/maya1-fastapi:latest', 
-        '--cache-from', 
-        'europe-west1-docker.pkg.dev/api-project-434000853810/mindfulness/maya1-fastapi:latest', 
-        '--build-arg', 
-        'HF_TOKEN=${_HF_TOKEN}',
+        'europe-west1-docker.pkg.dev/$PROJECT_ID/mindfulness/maya1-fastapi:latest', 
+        '--cache-from', 'europe-west1-docker.pkg.dev/$PROJECT_ID/mindfulness/maya1-fastapi:latest', 
+        '--build-arg', 'HF_TOKEN=${_HF_TOKEN}',
+        '--build-arg', 'BUILDKIT_INLINE_CACHE=1',
         '.']
+  env:
+    - 'DOCKER_BUILDKIT=1'
 # Push the image to Artifact Registry
 - name: 'gcr.io/cloud-builders/docker'
-  args: ['push', 'europe-west1-docker.pkg.dev/api-project-434000853810/mindfulness/maya1-fastapi:latest']
+  args: ['push', 'europe-west1-docker.pkg.dev/$PROJECT_ID/mindfulness/maya1-fastapi:latest']
 # Deploy image to Cloud Run
 - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
   entrypoint: gcloud
   args: ['run', 'deploy', 'maya1-tts', 
-    '--image', 'europe-west1-docker.pkg.dev/api-project-434000853810/mindfulness/maya1-fastapi:latest', 
+    '--image', 'europe-west1-docker.pkg.dev/$PROJECT_ID/mindfulness/maya1-fastapi:latest', 
     '--region', 'europe-west1',
     '--memory', '16Gi', 
     '--cpu', '8',
@@ -31,7 +32,7 @@ steps:
     '--set-env-vars', 'MAYA1_MODEL_PATH=./local_model,SNAC_MODEL_PATH=./local_snac,PYTORCH_ALLOC_CONF=expandable_segments:True,SNAC_DEVICE=cpu'
   ]
 images:
-- 'europe-west1-docker.pkg.dev/api-project-434000853810/mindfulness/maya1-fastapi:latest'
+- 'europe-west1-docker.pkg.dev/$PROJECT_ID/mindfulness/maya1-fastapi:latest'
 
 substitutions:
   _HF_TOKEN: ""

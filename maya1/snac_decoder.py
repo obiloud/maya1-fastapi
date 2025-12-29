@@ -9,7 +9,6 @@ from .constants import (
     CODE_END_TOKEN_ID,
     CODE_TOKEN_OFFSET,
     SNAC_MODEL_NAME,
-    SNAC_SAMPLE_RATE,
     SNAC_TOKENS_PER_FRAME,
 )
 
@@ -46,10 +45,10 @@ class SNACDecoder:
         self.max_batch_size = max_batch_size
         self.batch_timeout_ms = batch_timeout_ms
         
-        snack_model = os.environ.get('SNAC_MODEL_PATH', SNAC_MODEL_NAME)
+        snac_model = os.environ.get('SNAC_MODEL_PATH', SNAC_MODEL_NAME)
 
         print(f"Loading SNAC 24kHz model to {device}...")
-        self.snac_model = SNAC.from_pretrained(snack_model).eval().to(device)
+        self.snac_model = SNAC.from_pretrained(snac_model).eval().to(device)
 
         if device == "cpu":
             torch.set_num_threads(8)

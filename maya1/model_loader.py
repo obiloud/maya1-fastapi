@@ -72,16 +72,18 @@ class Maya1Model:
         engine_args = AsyncEngineArgs(
             model=model_path,
             tokenizer=model_path,
-            quantization="fp8",
+            # quantization="fp8", # Remove if prosody feels "off"
             kv_cache_dtype="fp8",
             dtype=dtype,
             max_model_len=max_model_len,
             gpu_memory_utilization=gpu_memory_utilization,
             tensor_parallel_size=tensor_parallel_size,
             trust_remote_code=trust_remote_code,
-            disable_log_stats=False,
-            max_num_seqs=1,
+            disable_log_stats=False, 
+            max_num_seqs=4,           # Increased from 1 for reliability
             enable_prefix_caching=True,
+            enforce_eager=True,
+            max_num_batched_tokens=max_model_len, 
             **engine_kwargs
         )
         
@@ -104,13 +106,16 @@ class Maya1Model:
         print(f"All {len(ALL_EMOTION_TAGS)} emotion tags validated")
     
     def _init_special_tokens(self):
-        """Precompute special token strings for fast prefix building."""
-        self.soh_token = self.tokenizer.decode([SOH_ID])
-        self.bos_token = self.tokenizer.bos_token
-        self.eot_token = self.tokenizer.decode([TEXT_EOT_ID])
-        self.eoh_token = self.tokenizer.decode([EOH_ID])
-        self.soa_token = self.tokenizer.decode([SOA_ID])
-        self.sos_token = self.tokenizer.decode([CODE_START_TOKEN_ID])
+        """Precompute special token strings ensuring no hidden prefix/suffix."""
+        def clean_decode(token_id):
+            return self.tokenizer.decode([token_id]).strip()
+
+        self.soh_token = clean_decode(SOH_ID)
+        self.bos_token = self.tokenizer.bos_token or ""
+        self.eot_token = clean_decode(TEXT_EOT_ID)
+        self.eoh_token = clean_decode(EOH_ID)
+        self.soa_token = clean_decode(SOA_ID)
+        self.sos_token = clean_decode(CODE_START_TOKEN_ID)
     
     async def generate(self, prompt: str, sampling_params: SamplingParams):
         """

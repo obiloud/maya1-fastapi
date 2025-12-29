@@ -13,10 +13,10 @@ ENV HF_TOKEN=$HF_TOKEN
 # Use BuildKit cache mounts to persist the HF cache across builds
 # This ensures that even if the layer is invalidated, the files are already on disk
 RUN --mount=type=cache,target=/root/.cache/huggingface \
-    huggingface-cli download maya-research/maya1 --local-dir ./maya1
+    hf download maya-research/maya1 --local-dir ./maya1
 
 RUN --mount=type=cache,target=/root/.cache/huggingface \
-    huggingface-cli download hubertsiuzdak/snac_24khz --local-dir ./snac
+    hf download hubertsiuzdak/snac_24khz --local-dir ./snac
 
 # Stage 2: Final Production Image
 FROM vllm/vllm-openai:latest
@@ -55,7 +55,7 @@ COPY maya1/ maya1/
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1 [cite: 5]
+    CMD curl -f http://localhost:8000/health || exit 1
 
 ENTRYPOINT []
 CMD ["python3", "-m", "uvicorn", "maya1.api_v2:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--loop", "uvloop"]

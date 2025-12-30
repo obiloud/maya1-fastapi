@@ -21,7 +21,7 @@ class Maya1Model:
         model_path: str = None,
         dtype: str = "bfloat16",
         max_model_len: int = DEFAULT_MAX_MODEL_LEN,
-        gpu_memory_utilization: float = 0.8,
+        gpu_memory_utilization: float = 0.75,
         tensor_parallel_size: int = 1,
         **engine_kwargs
     ):
@@ -72,7 +72,6 @@ class Maya1Model:
         engine_args = AsyncEngineArgs(
             model=model_path,
             tokenizer=model_path,
-            # quantization="fp8", # Remove if prosody feels "off"
             kv_cache_dtype="fp8",
             dtype=dtype,
             max_model_len=max_model_len,
@@ -80,9 +79,9 @@ class Maya1Model:
             tensor_parallel_size=tensor_parallel_size,
             trust_remote_code=trust_remote_code,
             disable_log_stats=False, 
-            max_num_seqs=4,           # Increased from 1 for reliability
+            max_num_seqs=2,
             enable_prefix_caching=True,
-            enforce_eager=True,
+            # enforce_eager=True,
             max_num_batched_tokens=max_model_len, 
             **engine_kwargs
         )

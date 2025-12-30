@@ -14,10 +14,10 @@ import logging
 import multiprocessing as mp
 from contextlib import asynccontextmanager
 
-from .logging import start_logging_listener
 from .model_loader import Maya1Model
 from .prompt_builder import Maya1PromptBuilder
-from .long_form_streaming_pipeline import Maya1SlidingWindowPipeline
+from .streaming_pipeline_chunks import Maya1LongPipeline
+from .snac_decoder import SNACDecoder
 from .constants import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
@@ -46,6 +46,7 @@ if sys.platform != "win32":
 # Global state
 model = None
 prompt_builder = None
+snac_decoder = None
 streaming_pipeline = None
 
 
@@ -55,15 +56,8 @@ streaming_pipeline = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI): # FIXED TYPO: lifspan -> lifespan
-    global model, prompt_builder, streaming_pipeline
-    
-    # 1. Initialize Multiprocessing Context first
-    ctx = mp.get_context('spawn')
-    log_queue = ctx.Queue()
-    
-    # Start Logging Listener
-    log_listener = start_logging_listener(log_queue)
-    log_listener.start()
+    global model, prompt_builder, snac_decoder, streaming_pipeline
+
 
     logger.info("\n" + "="*60 + "\n Starting Maya1 TTS API Server\n" + "="*60)
     
@@ -72,36 +66,22 @@ async def lifespan(app: FastAPI): # FIXED TYPO: lifspan -> lifespan
     model = Maya1Model() 
     prompt_builder = Maya1PromptBuilder(model.tokenizer, model)
     
+    # Initialize SNAC Decoder
+    snac_decoder = SNACDecoder(compile_decoder=True)
+    await snac_decoder.start_batch_processor()
+
     # Initialize the Streaming Pipeline
     # This spawns the AsyncSNACProcess correctly within the lifespan
-    streaming_pipeline = Maya1SlidingWindowPipeline(model, prompt_builder, log_queue)
+    streaming_pipeline = Maya1LongPipeline(model, prompt_builder, snac_decoder)
 
-    # BLOCK until ready
-    logger.info("Waiting for SNAC Decoder to warm up...")
-    max_wait = 30 # seconds
-    start_wait = time.time()
-    
-    while not streaming_pipeline.ready_event.is_set():
-        if time.time() - start_wait > max_wait:
-            logger.error("❌ SNAC Decoder failed to signal ready. Check child logs!")
-            break
-        await asyncio.sleep(0.5)
-    
-    if streaming_pipeline.ready_event.is_set():
-        logger.info("🚀 System fully initialized and ready for requests.")
+    logger.info("🚀 System fully initialized and ready for requests.")
 
     yield
 
     # Cleanup
     logger.info("Shutting down...")
-    if streaming_pipeline:
-        # Sentinel to stop child process
-        streaming_pipeline.token_q.put(None) 
-        streaming_pipeline.decoder_proc.join(timeout=5)
-    
-    if log_listener:
-        log_queue.put(None)
-        log_listener.stop()
+    if snac_decoder and snac_decoder.is_running:
+        await snac_decoder.stop_batch_processor()
 
 
 # Initialize FastAPI app
@@ -300,12 +280,8 @@ async def _generate_tts_streaming(description, text, **kwargs):
     async def audio_stream_generator():
         yield create_wav_header(sample_rate=AUDIO_SAMPLE_RATE)
 
-        start_time = None
-        total_samples_yielded = 0
-        
         # 20ms of silence in bytes (24000 samples/sec * 0.02 sec * 2 bytes per sample)
         silence_chunk = b'\x00' * int(AUDIO_SAMPLE_RATE * 0.02 * 2)
-        silence_samples = len(silence_chunk) // 2
 
         # Convert the pipeline generator to an iterator we can manually poll
         stream_iter = streaming_pipeline.generate_speech_stream(
@@ -321,25 +297,8 @@ async def _generate_tts_streaming(description, text, **kwargs):
             except asyncio.TimeoutError:
                 # HEARTBEAT TRIGGERED: Send silence to keep the socket open
                 logger.info("💓 Heartbeat: Sending silence to keep Cloud Run alive...")
-                total_samples_yielded += silence_samples
                 yield silence_chunk
                 continue
-
-            # --- Normal Pacing Logic ---
-            num_samples = len(audio_chunk) // 2
-            
-            if start_time is None:
-                start_time = time.time()
-                total_samples_yielded += num_samples
-                yield audio_chunk
-                continue
-            
-            total_samples_yielded += num_samples
-            elapsed = time.time() - start_time
-            expected = total_samples_yielded / AUDIO_SAMPLE_RATE
-            
-            if expected > elapsed:
-                await asyncio.sleep(expected - elapsed)
             
             yield audio_chunk
     

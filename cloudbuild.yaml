@@ -26,10 +26,10 @@ steps:
     '--gpu-type', 'nvidia-l4',
     '--no-cpu-throttling',
     '--min-instances', '0',
-    '--max-instances', '2',
+    '--max-instances', '1',
     '--port', '8000',
     '--allow-unauthenticated',
-    '--set-env-vars', 'MAYA1_MODEL_PATH=./local_model,SNAC_MODEL_PATH=./local_snac,PYTORCH_ALLOC_CONF=expandable_segments:True,SNAC_DEVICE=cpu'
+    '--set-env-vars', 'MAYA1_MODEL_PATH=./local_model,SNAC_MODEL_PATH=./local_snac,PYTORCH_ALLOC_CONF=expandable_segments:True'
   ]
 images:
 - 'europe-west1-docker.pkg.dev/$PROJECT_ID/mindfulness/maya1-fastapi:latest'

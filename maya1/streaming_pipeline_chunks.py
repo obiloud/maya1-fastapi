@@ -137,55 +137,82 @@ class Maya1LongPipeline:
         body = new_audio[CROSSFADE_SAMPLES:-CROSSFADE_SAMPLES]
         
         return np.concatenate((mixed, body)).astype(np.int16).tobytes()
-    
-    async def fetch_audio_manager(self, sampling_params, description:str = DESCRIPTION_DEFAULT, pipeline_items:List[PipelineItem] = None):
-        self.is_generating = True
-    
-        # This semaphore ensures we don't overload the GPU/Memory 
-        # by generating too many chunks ahead of time.
-        look_ahead_limit = asyncio.Semaphore(2) 
 
-        async def process_chunk(item:PipelineItem):
-            async with look_ahead_limit:
-                if item.type == 'pause':
-                    if self.previous_chunk_tail is not None:
-                        await self.audio_queue.put(self.previous_chunk_tail.astype(np.int16).tobytes())
-                        self.previous_chunk_tail = np.zeros(CROSSFADE_SAMPLES, dtype=np.float32)    # Reset crossfader
+    async def fetch_audio_manager(self, sampling_params, description: str, pipeline_items: List[PipelineItem]):
+        self.is_streaming = True
+        
+        # This queue allows the LLM to hand off tokens to the Decoder
+        # and immediately start the next generation call.
+        decode_queue = asyncio.Queue(maxsize=2)
 
-                    return generate_silent_bytes(item.duration)
+        async def decoder_worker():
+            """
+            CONSUMER TASK: Runs in the background.
+            It pulls tokens from the queue and decodes them while the LLM 
+            is busy generating the next chunk.
+            """
+            while True:
+                item_data = await decode_queue.get()
+                if item_data is None:  # Stop signal
+                    decode_queue.task_done()
+                    break
                 
-                # 1. Inference (LLM Stage)
-                prompt = self.prompt_builder.build_prefix(description, item.content)
-                outputs = await self.model.generate(prompt, sampling_params)
-                snac_codes = self._extract_snac_codes(outputs[0].outputs[0].token_ids)
+                p_item, snac_codes = item_data
                 
-                # 2. Decoding (DSP Stage)
-                # While this is decoding, the semaphore allows the NEXT 
-                # call to model.generate to start!
-                return await self.snac_decoder.decode_single_async(snac_codes)
+                try:
+                    if p_item.type == 'pause':
+                        # Flush tail before silence
+                        if self.previous_chunk_tail is not None:
+                            await self.audio_queue.put(self.previous_chunk_tail.astype(np.int16).tobytes())
+                            self.previous_chunk_tail = None
+                        
+                        audio_bytes = generate_silent_bytes(p_item.duration)
+                    else:
+                        # While this is awaiting, the loop below is hitting the LLM again!
+                        audio_bytes = await self.snac_decoder.decode_single_async(snac_codes)
+                    
+                    if audio_bytes:
+                        processed = self._crossfade_chunks(audio_bytes)
+                        for i in range(0, len(processed), AUDIO_CHUNK_SIZE):
+                            await self.audio_queue.put(processed[i:i+AUDIO_CHUNK_SIZE])
+                finally:
+                    decode_queue.task_done()
+
+        # 1. Start the Decoder worker in the background
+        worker_task = asyncio.create_task(decoder_worker())
 
         try:
-            # We process items in order, but the underlying tasks can overlap
-            for idx, item in enumerate(pipeline_items):
-                if item.type == 'text':
-                    logger.info(f"  {idx}: [TTS] {item.content[:50]}...")
-                else:
-                    logger.info(f"  {idx}: [SILENCE] {item.duration}s")                
+            # 2. PRODUCER LOOP: Focus only on the LLM (The Bottleneck)
+            for item in pipeline_items:
+                if item.type == 'pause':
+                    await decode_queue.put((item, None))
+                    continue
+
+                prompt = self.prompt_builder.build_prefix(description, item.content)
                 
-                audio_bytes = await process_chunk(item)
+                # This is your 0.5s stage
+                outputs = await self.model.generate(prompt, sampling_params)
                 
-                if audio_bytes:
-                    processed = self._crossfade_chunks(audio_bytes)
-                    for i in range(0, len(processed), AUDIO_CHUNK_SIZE):
-                        await self.audio_queue.put(processed[i:i+AUDIO_CHUNK_SIZE])
-        except asyncio.CancelledError:
-            logger.info("Streaming cancelled by user. Stopping inference.")
-            raise            
+                if outputs:
+                    snac_codes = self._extract_snac_codes(outputs[0].outputs[0].token_ids)
+                    # HAND OFF to the worker and IMMEDIATELY loop back to 'model.generate'
+                    await decode_queue.put((item, snac_codes))
+            
+            # 3. Wait for the background worker to finish all hand-offs
+            await decode_queue.join()
+            
         finally:
+            # 4. Cleanup
+            await decode_queue.put(None)
+            await worker_task
+            
+            # Final tail flush
             if self.previous_chunk_tail is not None:
                 await self.audio_queue.put(self.previous_chunk_tail.astype(np.int16).tobytes())
-            self.is_generating = False
+                self.previous_chunk_tail = None
+                
             await self.audio_queue.put(None)
+            self.is_streaming = False
         
     async def generate_speech_stream(
         self,

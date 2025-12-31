@@ -22,13 +22,13 @@ from .constants import (
 
 RATE = 2400
 CHANNELS = 1
-QUEUE_MAX_SIZE = 3000
+QUEUE_MAX_SIZE = 2000
 AUDIO_CHUNK_SIZE = 8192
 
 # # Buffering Config
-# BUFFER_DURATION_SEC = 3.0
-# BYTES_PER_SEC = RATE * 2 * CHANNELS
-# MIN_START_BYTES = BYTES_PER_SEC * BUFFER_DURATION_SEC 
+BUFFER_DURATION_SEC = 3.0
+BYTES_PER_SEC = RATE * 2 * CHANNELS
+MIN_START_BYTES = BYTES_PER_SEC * BUFFER_DURATION_SEC 
 # REBUFFER_TARGET_SEC = 2.0
 # REBUFFER_TARGET_BYTES = BYTES_PER_SEC * REBUFFER_TARGET_SEC 
 CROSSFADE_SAMPLES = 1200
@@ -58,9 +58,7 @@ class Maya1LongPipeline:
         self.model = model
         self.prompt_builder = prompt_builder
         self.snac_decoder = snac_decoder
-        self.audio_queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
         self.previous_chunk_tail = np.zeros(CROSSFADE_SAMPLES, dtype=np.float32) 
-        self.is_generating = False
         
         logger.info("Pipeline initialized")
 
@@ -138,9 +136,7 @@ class Maya1LongPipeline:
         
         return np.concatenate((mixed, body)).astype(np.int16).tobytes()
 
-    async def fetch_audio_manager(self, sampling_params, description: str, pipeline_items: List[PipelineItem]):
-        self.is_streaming = True
-        
+    async def fetch_audio_manager(self, audio_queue, description: str, pipeline_items: List[PipelineItem], **kwargs):        
         # This queue allows the LLM to hand off tokens to the Decoder
         # and immediately start the next generation call.
         decode_queue = asyncio.Queue(maxsize=2)
@@ -163,7 +159,7 @@ class Maya1LongPipeline:
                     if p_item.type == 'pause':
                         # Flush tail before silence
                         if self.previous_chunk_tail is not None:
-                            await self.audio_queue.put(self.previous_chunk_tail.astype(np.int16).tobytes())
+                            await audio_queue.put(self.previous_chunk_tail.astype(np.int16).tobytes())
                             self.previous_chunk_tail = None
                         
                         audio_bytes = generate_silent_bytes(p_item.duration)
@@ -174,7 +170,7 @@ class Maya1LongPipeline:
                     if audio_bytes:
                         processed = self._crossfade_chunks(audio_bytes)
                         for i in range(0, len(processed), AUDIO_CHUNK_SIZE):
-                            await self.audio_queue.put(processed[i:i+AUDIO_CHUNK_SIZE])
+                            await audio_queue.put(processed[i:i+AUDIO_CHUNK_SIZE])
                 finally:
                     decode_queue.task_done()
 
@@ -189,6 +185,14 @@ class Maya1LongPipeline:
                     continue
 
                 prompt = self.prompt_builder.build_prefix(description, item.content)
+
+                sampling_params = SamplingParams(
+                    temperature=kwargs.get("temperature", DEFAULT_TEMPERATURE),
+                    top_p=kwargs.get("top_p", DEFAULT_TOP_P),
+                    max_tokens=kwargs.get("max_tokens", DEFAULT_MAX_TOKENS),
+                    min_tokens=kwargs.get("min_tokens", DEFAULT_MIN_TOKENS),
+                    stop_token_ids=[CODE_END_TOKEN_ID],
+                )
                 
                 # This is your 0.5s stage
                 outputs = await self.model.generate(prompt, sampling_params)
@@ -208,22 +212,12 @@ class Maya1LongPipeline:
             
             # Final tail flush
             if self.previous_chunk_tail is not None:
-                await self.audio_queue.put(self.previous_chunk_tail.astype(np.int16).tobytes())
+                await audio_queue.put(self.previous_chunk_tail.astype(np.int16).tobytes())
                 self.previous_chunk_tail = None
                 
-            await self.audio_queue.put(None)
-            self.is_streaming = False
+            await audio_queue.put(None)
         
-    async def generate_speech_stream(
-        self,
-        description: str,
-        text: str,
-        temperature: float = DEFAULT_TEMPERATURE,
-        top_p: float = DEFAULT_TOP_P,
-        max_tokens: int = DEFAULT_MAX_TOKENS,
-        repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
-        seed: Optional[int] = None,
-    ) -> AsyncGenerator[bytes, None]:
+    async def generate_speech_stream(self, description: str, text: str, **kwargs) -> AsyncGenerator[bytes, None]:
         """
         Generate speech audio with sliding window streaming.
         
@@ -239,34 +233,33 @@ class Maya1LongPipeline:
         Yields:
             Audio bytes (int16 PCM, 24kHz mono)
         """
+        audio_queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
+
         pipeline_items = self.prepare_pipeline(text)
 
-        sampling_params = SamplingParams(
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            min_tokens=DEFAULT_MIN_TOKENS,
-            repetition_penalty=repetition_penalty,
-            stop_token_ids=[CODE_END_TOKEN_ID],
-            seed=seed if seed is not None else DEFAULT_SEED,
-        )
+        producer_task = asyncio.create_task(self.fetch_audio_manager(audio_queue, description, pipeline_items, **kwargs))
 
-        producer_task = asyncio.create_task(self.fetch_audio_manager(sampling_params, description, pipeline_items))
-        
         try:
+            bytes_yielded = 0
             while True:
+                current_buffer_size = audio_queue.qsize() * AUDIO_CHUNK_SIZE
+                required_buffer = MIN_START_BYTES if bytes_yielded > 0 else (BYTES_PER_SEC * 0.5)
+
                 # Re-buffering logic based on queue size, not global byte counter
-                if self.audio_queue.qsize() < 3 and self.is_generating:
+                if current_buffer_size < required_buffer and producer_task.done() is False:
                     await asyncio.sleep(0.05)
                     continue
                     
-                data = await self.audio_queue.get()
+                data = await audio_queue.get()
                 if data is None: 
-                    self.audio_queue.task_done()
+                    audio_queue.task_done()
                     break
 
                 yield data
         finally:
-            await producer_task
-
-            self.previous_chunk_tail = np.zeros(CROSSFADE_SAMPLES, dtype=np.float32)
+            if not producer_task.done():
+                producer_task.cancel()
+                try:
+                    await producer_task
+                except asyncio.CancelledError:
+                    pass

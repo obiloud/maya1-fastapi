@@ -67,7 +67,7 @@ async def lifespan(app: FastAPI): # FIXED TYPO: lifspan -> lifespan
     prompt_builder = Maya1PromptBuilder(model.tokenizer, model)
     
     # Initialize SNAC Decoder
-    snac_decoder = SNACDecoder(compile_decoder=True)
+    snac_decoder = SNACDecoder(device="cpu")
     await snac_decoder.start_batch_processor()
 
     # Initialize the Streaming Pipeline
@@ -276,33 +276,50 @@ async def _generate_tts_complete(description, text, **kwargs):
 
 
 async def _generate_tts_streaming(description, text, **kwargs):
-    """Generate streaming audio with Digital Silence heartbeats to keep connection alive."""    
+    
     async def audio_stream_generator():
-        yield create_wav_header(sample_rate=AUDIO_SAMPLE_RATE)
+        # Consider removing WAV header if the client supports raw PCM
+        # yield create_wav_header(sample_rate=AUDIO_SAMPLE_RATE)
 
-        # 20ms of silence in bytes (24000 samples/sec * 0.02 sec * 2 bytes per sample)
-        silence_chunk = b'\x00' * int(AUDIO_SAMPLE_RATE * 0.02 * 2)
-
-        # Convert the pipeline generator to an iterator we can manually poll
+        # 1. Use anext() properly (Python 3.10+)
         stream_iter = streaming_pipeline.generate_speech_stream(
             description=description, text=text, **kwargs
-        ).__aiter__()
+        )
 
         while True:
             try:
-                # Wait up to 15 seconds for the next real audio chunk
-                audio_chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=15.0)
+                # Use a shorter timeout if the goal is strictly a keep-alive heartbeat
+                # Cloud Run usually requires data every 10-30s
+                audio_chunk = await asyncio.wait_for(anext(stream_iter), timeout=10.0)
+                
+                if audio_chunk:
+                    yield audio_chunk
+                    
             except StopAsyncIteration:
+                logger.info("Stream completed normally.")
                 break
             except asyncio.TimeoutError:
-                # HEARTBEAT TRIGGERED: Send silence to keep the socket open
-                logger.info("💓 Heartbeat: Sending silence to keep Cloud Run alive...")
-                yield silence_chunk
+                # HEARTBEAT: We send a "Null" byte or a tiny silence.
+                # WARNING: In a WAV container, sending random bytes can 
+                # cause the decoder to desync.
+                logger.info("💓 Heartbeat triggered.")
+                # If using raw PCM, 2 bytes of 0 is a single sample of silence.
+                yield b'\x00\x00' 
                 continue
-            
-            yield audio_chunk
+            except Exception as e:
+                logger.error(f"Streaming error: {e}")
+                break
     
-    return StreamingResponse(audio_stream_generator(), media_type="audio/wav")
+    # Add headers to help the browser handle the stream
+    return StreamingResponse(
+        audio_stream_generator(), 
+        media_type="audio/l16; rate=24000", # Better for raw streaming
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Content-Type-Options": "nosniff"
+        }
+    )
 
 # For running directly
 if __name__ == "__main__":

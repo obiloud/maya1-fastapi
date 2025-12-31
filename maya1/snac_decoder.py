@@ -53,7 +53,7 @@ class SNACDecoder:
         self.snac_model = SNAC.from_pretrained(snac_model).eval().to(device)
 
         if device == "cpu":
-            torch.set_num_threads(8)
+            torch.set_num_threads(5)
             torch.set_grad_enabled(False)
 
             if hasattr(torch, 'set_flush_denormal'):

@@ -21,7 +21,7 @@ class Maya1Model:
         model_path: str = None,
         dtype: str = "bfloat16",
         max_model_len: int = DEFAULT_MAX_MODEL_LEN,
-        gpu_memory_utilization: float = 0.75,
+        gpu_memory_utilization: float = 0.85,
         tensor_parallel_size: int = 1,
         **engine_kwargs
     ):

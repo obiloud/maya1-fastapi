@@ -57,7 +57,7 @@ ALL_EMOTION_TAGS = [
 # Model configuration
 DEFAULT_MODEL_PATH = "maya-research/maya1"
 DEFAULT_CHECKPOINT = "checkpoint-25000"
-DEFAULT_MAX_MODEL_LEN = 8192
+DEFAULT_MAX_MODEL_LEN = 4096 # 8192
 
 # SNAC configuration
 SNAC_MODEL_NAME = "hubertsiuzdak/snac_24khz"

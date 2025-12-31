@@ -6,6 +6,7 @@ import numpy as np
 from .utils import recursive_word_chunker, parse_pause_tags, generate_silent_bytes
 import asyncio
 from dataclasses import dataclass
+import time
 
 from .constants import (
     CODE_START_TOKEN_ID,
@@ -136,7 +137,8 @@ class Maya1LongPipeline:
         
         return np.concatenate((mixed, body)).astype(np.int16).tobytes()
 
-    async def fetch_audio_manager(self, audio_queue, description: str, pipeline_items: List[PipelineItem], **kwargs):        
+    async def fetch_audio_manager(self, audio_queue, description: str, pipeline_items: List[PipelineItem], **kwargs):
+        logger.info("🚀 Producer Started")
         # This queue allows the LLM to hand off tokens to the Decoder
         # and immediately start the next generation call.
         decode_queue = asyncio.Queue(maxsize=2)
@@ -153,7 +155,7 @@ class Maya1LongPipeline:
                     decode_queue.task_done()
                     break
                 
-                p_item, snac_codes = item_data
+                idx, p_item, snac_codes = item_data
                 
                 try:
                     if p_item.type == 'pause':
@@ -168,6 +170,7 @@ class Maya1LongPipeline:
                         audio_bytes = await self.snac_decoder.decode_single_async(snac_codes)
                     
                     if audio_bytes:
+                        logger.info(f"✅ Producer: Item {idx} decoded")
                         processed = self._crossfade_chunks(audio_bytes)
                         for i in range(0, len(processed), AUDIO_CHUNK_SIZE):
                             await audio_queue.put(processed[i:i+AUDIO_CHUNK_SIZE])
@@ -179,9 +182,11 @@ class Maya1LongPipeline:
 
         try:
             # 2. PRODUCER LOOP: Focus only on the LLM (The Bottleneck)
-            for item in pipeline_items:
+            for i, item in enumerate(pipeline_items):
+                logger.info(f"📦 Producer: Processing item {i}")
+
                 if item.type == 'pause':
-                    await decode_queue.put((item, None))
+                    await decode_queue.put((i, item, None))
                     continue
 
                 prompt = self.prompt_builder.build_prefix(description, item.content)
@@ -195,16 +200,23 @@ class Maya1LongPipeline:
                 )
                 
                 # This is your 0.5s stage
+                start_inference = time.perf_counter()
                 outputs = await self.model.generate(prompt, sampling_params)
+                end_inference = time.perf_counter()
+                logger.info(f"⏱️ Inference for item {i} took {end_inference - start_inference:.2f}s")
                 
                 if outputs:
                     snac_codes = self._extract_snac_codes(outputs[0].outputs[0].token_ids)
                     # HAND OFF to the worker and IMMEDIATELY loop back to 'model.generate'
-                    await decode_queue.put((item, snac_codes))
+                    await decode_queue.put((i, item, snac_codes))
+                    logger.info(f"📦 Producer: item {i} SNAC codes handed off")
             
             # 3. Wait for the background worker to finish all hand-offs
             await decode_queue.join()
+            logger.info("🏁 Producer: All items finished")
             
+        except Exception as e:
+            logger.error(f"❌ Producer CRASHED: {e}", exc_info=True)
         finally:
             # 4. Cleanup
             await decode_queue.put(None)
@@ -233,17 +245,39 @@ class Maya1LongPipeline:
         Yields:
             Audio bytes (int16 PCM, 24kHz mono)
         """
+        logger.info(f"🏁 Starting stream for text: {text[:50]}...")
+
         audio_queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
+
+        chunks_sent = 0
+
+        start_time = asyncio.get_event_loop().time()
 
         pipeline_items = self.prepare_pipeline(text)
 
         producer_task = asyncio.create_task(self.fetch_audio_manager(audio_queue, description, pipeline_items, **kwargs))
 
+        async def watchdog():
+            """Logs status every 2s while the producer is running."""
+            while not producer_task.done():
+                elapsed = asyncio.get_event_loop().time() - start_time
+                q_size = audio_queue.qsize()
+                logger.info(
+                    f"🐕 Watchdog: T+{elapsed:.1f}s | "
+                    f"Queue: {q_size} chunks | "
+                    f"Producer Alive: {not producer_task.done()}"
+                )
+                health = await self.model.get_engine_health_status()
+                logger.info(f"🐕 Watchdog Engine Status: {health}")
+                await asyncio.sleep(2.0)
+
+        # Start the watchdog
+        watchdog_task = asyncio.create_task(watchdog())
+
         try:
-            bytes_yielded = 0
             while True:
                 current_buffer_size = audio_queue.qsize() * AUDIO_CHUNK_SIZE
-                required_buffer = MIN_START_BYTES if bytes_yielded > 0 else (BYTES_PER_SEC * 0.5)
+                required_buffer = MIN_START_BYTES if chunks_sent > 0 else (BYTES_PER_SEC * 0.5)
 
                 # Re-buffering logic based on queue size, not global byte counter
                 if current_buffer_size < required_buffer and producer_task.done() is False:
@@ -252,14 +286,22 @@ class Maya1LongPipeline:
                     
                 data = await audio_queue.get()
                 if data is None: 
+                    logger.info("🛑 Sentinel received. End of stream.")
                     audio_queue.task_done()
                     break
 
                 yield data
+                chunks_sent += 1
+
+        except Exception as e:
+            logger.error(f"❌ Producer status: {not producer_task.done()}. Error: {e}")
+
         finally:
+            watchdog_task.cancel()
             if not producer_task.done():
                 producer_task.cancel()
                 try:
                     await producer_task
                 except asyncio.CancelledError:
                     pass
+            logger.info(f"🔚 Generator closed. Sent {chunks_sent} chunks.")

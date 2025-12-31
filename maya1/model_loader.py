@@ -6,12 +6,14 @@ Loads Maya1 model with vLLM engine and validates emotion tags.
 import os
 from transformers import AutoTokenizer
 from vllm import AsyncLLMEngine, AsyncEngineArgs, SamplingParams
+import logging
 from .constants import (
     ALL_EMOTION_TAGS,
     DEFAULT_MAX_MODEL_LEN,
     SOH_ID, EOH_ID, SOA_ID, BOS_ID, TEXT_EOT_ID, CODE_START_TOKEN_ID,
 )
 
+logger = logging.getLogger('vLLM')
 
 class Maya1Model:
     """Maya1 TTS Model with vLLM inference engine."""
@@ -81,8 +83,8 @@ class Maya1Model:
             disable_log_stats=False, 
             max_num_seqs=2,
             enable_prefix_caching=True,
-            # enforce_eager=True,
-            max_num_batched_tokens=max_model_len, 
+            enforce_eager=True,
+            max_num_batched_tokens=512, 
             **engine_kwargs
         )
         
@@ -116,6 +118,23 @@ class Maya1Model:
         self.soa_token = clean_decode(SOA_ID)
         self.sos_token = clean_decode(CODE_START_TOKEN_ID)
     
+    async def get_engine_health_status(self):
+        """Directly inspect the vLLM scheduler state."""
+        if not self.engine:
+            return "Engine not initialized"
+        
+        # AsyncLLMEngine stores stats in the engine_step outputs
+        # but we can also check the stats produced by the background loop
+        stats = self.engine.engine.get_stats() # Internal vLLM method
+        
+        return {
+            "num_running": stats.num_running,
+            "num_swapped": stats.num_swapped,
+            "num_waiting": stats.num_waiting,
+            "gpu_cache_usage": stats.gpu_cache_usage,
+            "cpu_cache_usage": stats.cpu_cache_usage,
+        }
+
     async def generate(self, prompt: str, sampling_params: SamplingParams):
         """
         Generate tokens from prompt (non-streaming).
@@ -126,6 +145,8 @@ class Maya1Model:
             Generated output from vLLM
         """
         request_id = f"req_{id(prompt)}"
+
+        logger.info(f"🔮 vLLM Request {request_id} submitted to engine")
         
         # Collect results from async generator
         final_output = None
@@ -135,7 +156,9 @@ class Maya1Model:
             request_id=request_id
         ):
             final_output = output
-        
+
+        logger.info(f"✅ vLLM Request {request_id} completed")
+
         return [final_output] if final_output else []
     
     async def generate_stream(self, prompt: str, sampling_params: SamplingParams):

@@ -8,6 +8,9 @@ import asyncio
 from dataclasses import dataclass
 import time
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
+import functools
+from .worker import init_worker, worker_decode_task
 
 from .constants import (
     CODE_START_TOKEN_ID,
@@ -33,12 +36,10 @@ AUDIO_CHUNK_SIZE = 8192
 BUFFER_DURATION_SEC = 3.0
 BYTES_PER_SEC = RATE * 2 * CHANNELS
 MIN_START_BYTES = BYTES_PER_SEC * BUFFER_DURATION_SEC 
-# REBUFFER_TARGET_SEC = 2.0
-# REBUFFER_TARGET_BYTES = BYTES_PER_SEC * REBUFFER_TARGET_SEC 
+
 CROSSFADE_SAMPLES = 1200
 MAX_WORDS_PER_CHUNK = 60
 DESCRIPTION_DEFAULT = "Realistic male voice in the 40s with British accent. Low pitch, mellow timbre, slow pacing."
-
 
 logger = logging.getLogger('streamin_pipeline')
 
@@ -50,35 +51,33 @@ class PipelineItem:
 
 class Maya1LongPipeline:
     
-    def __init__(self, model, prompt_builder, snac_decoder):
+    def __init__(self, model, prompt_builder, snac_decoder_class=None, **decoder_kwargs):
         """
         Initialize sliding window streaming pipeline.
         
         Args:
             model: Maya1Model instance
             prompt_builder: Maya1PromptBuilder instance
-            snac_decoder: SNACDecoder instance
+            snac_decoder: SNACDecoder class
+            **kwargs: Additional keyword argument are passed to the SNACDecoder constructor.
+
+        Other Parameters:
+            device (str): Location where the `torch.Tensor` will be allocated, such as "cpu" or "cuda". 
         """
         self.model = model
         self.prompt_builder = prompt_builder
-        self.snac_decoder = snac_decoder
+        self.executor = ProcessPoolExecutor(
+            max_workers=1,
+            initializer=init_worker,
+            initargs=(snac_decoder_class, decoder_kwargs)
+        )
+        self.decode_lock = asyncio.Lock()
         
         logger.info("Pipeline initialized")
 
-    async def pre_warm(self):
-        """
-        Runs a dummy inference through the SNAC decoder to 
-        initialize PyTorch kernels and prevent cold-start timeouts.
-        """
-        logger.info("🔥 Pre-warming SNAC Decoder...")
-        # 28 tokens of silence/dummy data (4 frames)
-        dummy_tokens = [1000] * 28 
-        try:
-            # This will trigger kernel compilation/loading
-            await self.snac_decoder.decode_single_async(dummy_tokens)
-            logger.info("✅ SNAC Decoder warmed up and ready.")
-        except Exception as e:
-            logger.error(f"⚠️ Pre-warm failed: {e}")
+    async def shutdown(self):
+        """Call this when the server closes."""
+        self.executor.shutdown(wait=False)
 
     def prepare_pipeline(self, text) -> List[PipelineItem]:
         """
@@ -153,18 +152,23 @@ class Maya1LongPipeline:
 
         token_buffer = []
         is_first_chunk = True
+        loop = asyncio.get_running_loop()
         
         while True:
             item_data = await decode_queue.get()
             
             # --- STOP SIGNAL & FINAL FLUSH ---
             if item_data is None:
-                if len(token_buffer) >= 7:
-                    logger.info(f"Final flush: {len(token_buffer)} tokens")
-                    # Use standard decode for the tail to avoid cropping end-of-speech
-                    audio_bytes = await self.snac_decoder.decode_single_async(
-                        token_buffer, 
-                        use_sliding_window=False,
+                if len(token_buffer) >= TOKENS_PER_FRAME:
+                    logger.debug(f"Final flush: {len(token_buffer)} tokens")
+                    # Final Flush: Offload to executor
+                    audio_bytes = await loop.run_in_executor(
+                        self.executor,
+                        functools.partial(
+                            worker_decode_task,
+                            token_buffer,
+                            use_sliding_window=False,
+                        )
                     )
                     if audio_bytes:
                         await audio_queue.put(audio_bytes)
@@ -174,36 +178,59 @@ class Maya1LongPipeline:
             idx, p_item, snac_codes = item_data
             
             try:
-                if p_item.type == 'pause':
-                    token_buffer = [] # Reset buffer on pause
-                    await audio_queue.put(generate_silent_bytes(p_item.duration))
-                else:
-                    token_buffer.extend(snac_codes)
-                    logger.info(f"Buffer size: {len(token_buffer)}")
+                async with self.decode_lock:
+                    if p_item.type == 'pause':
+                        token_buffer = [] # Reset buffer on pause
+                        await audio_queue.put(generate_silent_bytes(p_item.duration))
+                    else:
+                        token_buffer.extend(snac_codes)
+                        logger.debug(f"Buffer size: {len(token_buffer)}")
 
-                    # --- FAST PATH: Get sound playing immediately ---
-                    if is_first_chunk and len(token_buffer) >= 7:
-                        first_frame = token_buffer[:7]
-                        audio_bytes = await self.snac_decoder.decode_single_async(
-                            first_frame, use_sliding_window=False, trim_warmup=True
-                        )
-                        if audio_bytes:
-                            await audio_queue.put(audio_bytes)
-                        token_buffer = token_buffer[7:]
-                        is_first_chunk = False
+                        # --- FAST PATH: Get sound playing immediately ---
+                        if is_first_chunk and len(token_buffer) >= TOKENS_PER_FRAME:
+                            first_frame = token_buffer[:TOKENS_PER_FRAME]
+                            
+                            logger.info(f"🚀 FAST PATH: Tokens {first_frame[:3]}... | Buffer: {len(token_buffer)}")
 
-                    # --- SLIDING WINDOW: Smooth continuous playback ---
-                    while len(token_buffer) >= WINDOW_SIZE:
-                        window = token_buffer[:WINDOW_SIZE]
-                        audio_bytes = await self.snac_decoder.decode_single_async(
-                            window, use_sliding_window=True
-                        )
-                        if audio_bytes:
-                            await audio_queue.put(audio_bytes)
-                        
-                        token_buffer = token_buffer[TOKENS_PER_FRAME:]
-                        await asyncio.sleep(0) # Keep event loop alive
-                    # logger.info(f"✅ Decoder: Chunk {idx} processed into window stream")
+                            token_buffer = token_buffer[TOKENS_PER_FRAME:]
+                            is_first_chunk = False
+
+                            # Offload to process pool
+                            audio_bytes = await loop.run_in_executor(
+                                self.executor,
+                                functools.partial(
+                                    worker_decode_task,
+                                    first_frame,
+                                    use_sliding_window=False,
+                                    trim_warmup=True
+                                )
+                            )
+                            if audio_bytes:
+                                await audio_queue.put(audio_bytes)
+
+                        # --- SLIDING WINDOW: Smooth continuous playback ---
+                        while len(token_buffer) >= WINDOW_SIZE:
+                            window = token_buffer[:WINDOW_SIZE]
+
+                            logger.info(f"🪟 WINDOW: Tokens {window[:3]}... | Buffer: {len(token_buffer)}")
+
+                            # Advance the buffer BEFORE the await to prevent re-processing
+                            token_buffer = token_buffer[TOKENS_PER_FRAME:]
+
+                            # Parallelize decoding!
+                            audio_bytes = await loop.run_in_executor(
+                                self.executor,
+                                functools.partial(
+                                    worker_decode_task,
+                                    window,
+                                    use_sliding_window=True,
+                                    trim_warmup=False
+                                )
+                            )
+                            if audio_bytes:
+                                await audio_queue.put(audio_bytes)
+                            
+                    logger.debug(f"✅ Decoder: Chunk {idx} processed into window stream")
             finally:
                 decode_queue.task_done()
 

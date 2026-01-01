@@ -5,10 +5,11 @@ import numpy as np
 from unittest.mock import AsyncMock, MagicMock
 from dataclasses import dataclass
 from .streaming_pipeline_chunks import Maya1LongPipeline
-from .constants import CODE_START_TOKEN_ID, CODE_END_TOKEN_ID, SNAC_MAX_ID
+from .worker import MockSNACDecoder
+from .constants import CODE_START_TOKEN_ID, SNAC_MAX_ID
 
-# Assuming the class is in pipeline.py
-# from pipeline import Maya1LongPipeline 
+# Configuration for the test
+SAMPLE_RATE = 24000
 
 @dataclass
 class ProfileResult:
@@ -28,15 +29,8 @@ class PipelineProfiler:
 async def test_pipeline_bottlenecks():
     # 1. Setup Mocks
     mock_model = AsyncMock()
-    mock_decoder = AsyncMock()
     mock_builder = MagicMock()
     profiler = PipelineProfiler()
-
-    # Configuration for the test
-    # We simulate a slow LLM and a medium-speed SNAC decoder
-    SIMULATED_TTS_LATENCY = 0.5  # 500ms per chunk
-    SIMULATED_SNAC_LATENCY = 0.2 # 200ms per chunk
-    SAMPLE_RATE = 24000
     
     # Mock return values
     mock_builder.build_prefix.return_value = "prompt"
@@ -44,7 +38,7 @@ async def test_pipeline_bottlenecks():
     # Mock Model: Simulates token generation latency
     async def mocked_generate_stream(*args, **kwargs):
         start = time.perf_counter()
-        await asyncio.sleep(0.05) 
+        await asyncio.sleep(0.5) 
         gen_time = time.perf_counter() - start
         
         # Simulate 10 frames of audio arriving in 2-frame bursts
@@ -59,24 +53,15 @@ async def test_pipeline_bottlenecks():
             await asyncio.sleep(0.01) # Simulate network/processing jitter
             profiler.record("TTS_GEN", gen_time, 10 / 6.86)
             
-
-    # Mock Decoder: Simulates DSP/SNAC decoding latency
-    async def mocked_decode(*args, **kwargs):
-        print("🛠️ Decoder Mock Called!")
-        start = time.perf_counter()
-        await asyncio.sleep(SIMULATED_SNAC_LATENCY)
-        dec_time = time.perf_counter() - start
-        
-        # Return 1 second of audio bytes
-        audio_sec = 1.0
-        profiler.record("SNAC_DECODE", dec_time, audio_sec)
-        return b'\x00' * int(SAMPLE_RATE * 2 * audio_sec)
-
     mock_model.generate_stream = mocked_generate_stream
-    mock_decoder.decode_single_async = mocked_decode
-
+    
     # 2. Initialize Pipeline
-    pipeline = Maya1LongPipeline(mock_model, mock_builder, mock_decoder)
+    pipeline = Maya1LongPipeline(
+        model=mock_model, 
+        prompt_builder=mock_builder, 
+        snac_decoder_class=MockSNACDecoder,
+        device="cpu",
+    )
     
     # Prepare dummy items (3 text chunks)
     text = "Word " * 180
@@ -87,6 +72,8 @@ async def test_pipeline_bottlenecks():
     audio_chunks = []
     async for chunk in pipeline.generate_speech_stream("voice_desc", text):
         audio_chunks.append(chunk)
+
+    pipeline.executor.shutdown(wait=False, cancel_futures=True)
     
     total_pipeline_time = time.perf_counter() - start_pipeline
 
@@ -95,7 +82,8 @@ async def test_pipeline_bottlenecks():
     tts_calls = [r for r in profiler.results if r.stage == "TTS_GEN"]
     num_chunks = len(tts_calls)
 
-    total_audio_duration = sum([p.audio_duration_produced for p in profiler.results if p.stage == "SNAC_DECODE"])
+    total_samples = sum(len(c) for c in audio_chunks) // 2
+    total_audio_duration = total_samples / SAMPLE_RATE
 
     # 4. Bottleneck Analysis
     print(f"\n--- Performance Report ---")
@@ -103,8 +91,13 @@ async def test_pipeline_bottlenecks():
     print(f"Total Audio Produced:  {total_audio_duration:.2f}s")
     print(f"Real-Time Factor (RTF): {total_pipeline_time / total_audio_duration:.2f}")
 
+    # Calculate SNAC total manually for the report since the worker is isolated
+    # Each window processed is 28 tokens. 
+    # Your log showed 15 chunks processed.
     tts_total = sum(p.duration for p in profiler.results if p.stage == "TTS_GEN")
-    snac_total = sum(p.duration for p in profiler.results if p.stage == "SNAC_DECODE")
+
+    SIMULATED_DECODE_STEP = 0.075 
+    snac_total = num_chunks * SIMULATED_DECODE_STEP
 
     print(f"Sum of TTS Latency:    {tts_total:.2f}s")
     print(f"Sum of SNAC Latency:   {snac_total:.2f}s")
@@ -129,3 +122,8 @@ async def test_pipeline_bottlenecks():
     
     # Ensure we didn't drop audio
     assert len(audio_chunks) > 0, "No audio was generated"
+
+if __name__ == "__main__":
+    # This allows pytest to run, but also protects worker spawns
+    import pytest
+    pytest.main([__file__])

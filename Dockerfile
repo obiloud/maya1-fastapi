@@ -44,7 +44,7 @@ ENV MKL_NUM_THREADS=1
 # Copying only requirements.txt first to leverage cache
 COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir -r requirements.txt 
+    pip install --no-cache-dir -r requirements.txt google-cloud-logging
 
 # 5. Copy model artifacts (Large but static)
 COPY --from=downloader /models/maya1 ./local_model

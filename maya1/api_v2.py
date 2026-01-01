@@ -31,6 +31,20 @@ GENERATE_TIMEOUT = 60
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# Imports the Cloud Logging client library
+import google.cloud.logging
+
+# Instantiates a client
+client = google.cloud.logging.Client()
+
+# Retrieves a Cloud Logging handler based on the environment
+# you're running in and integrates the handler with the
+# Python logging module. By default this captures all logs
+# at INFO level and higher
+client.setup_logging()
+
+logging.basicConfig(level=logging.DEBUG)
+
 logger = logging.getLogger("api_v2")
 
 # Load environment variables
@@ -58,23 +72,14 @@ streaming_pipeline = None
 async def lifespan(app: FastAPI): # FIXED TYPO: lifspan -> lifespan
     global model, prompt_builder, snac_decoder, streaming_pipeline
 
-
     logger.info("\n" + "="*60 + "\n Starting Maya1 TTS API Server\n" + "="*60)
     
     # Load Model (vLLM Engine)
-    # Ensure Maya1Model sets gpu_memory_utilization=0.8 inside its __init__
     model = Maya1Model() 
+
     prompt_builder = Maya1PromptBuilder(model.tokenizer, model)
-    
-    # Initialize SNAC Decoder
-    snac_decoder = SNACDecoder(device="cpu")
-    await snac_decoder.start_batch_processor()
 
-    # Initialize the Streaming Pipeline
-    # This spawns the AsyncSNACProcess correctly within the lifespan
-    streaming_pipeline = Maya1LongPipeline(model, prompt_builder, snac_decoder)
-
-    await streaming_pipeline.pre_warm()
+    streaming_pipeline = Maya1LongPipeline(model, prompt_builder, SNACDecoder, device="cpu")
 
     logger.info("🚀 System fully initialized and ready for requests.")
 
@@ -82,8 +87,7 @@ async def lifespan(app: FastAPI): # FIXED TYPO: lifspan -> lifespan
 
     # Cleanup
     logger.info("Shutting down...")
-    if snac_decoder and snac_decoder.is_running:
-        await snac_decoder.stop_batch_processor()
+    streaming_pipeline.shutdown()
 
 
 # Initialize FastAPI app

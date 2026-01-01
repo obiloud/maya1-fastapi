@@ -5,6 +5,7 @@ import numpy as np
 from unittest.mock import AsyncMock, MagicMock
 from dataclasses import dataclass
 from .streaming_pipeline_chunks import Maya1LongPipeline
+from .constants import CODE_START_TOKEN_ID, CODE_END_TOKEN_ID, SNAC_MAX_ID
 
 # Assuming the class is in pipeline.py
 # from pipeline import Maya1LongPipeline 
@@ -46,14 +47,20 @@ async def test_pipeline_bottlenecks():
         await asyncio.sleep(SIMULATED_TTS_LATENCY)
         gen_time = time.perf_counter() - start
         
+        # Create the nested structure vLLM expects
+        mock_request_output = MagicMock()
+        # This makes outputs[0] work
+        mock_request_output.__getitem__.return_value = mock_request_output 
+        # This makes outputs[0].outputs[0] work
+        token_ids = [CODE_START_TOKEN_ID] + ([SNAC_MAX_ID] * 70) + [CODE_END_TOKEN_ID]
+        mock_request_output.outputs = [MagicMock(token_ids=token_ids)]
         # Return dummy vLLM output structure
-        output = MagicMock()
-        output.outputs[0].token_ids = [1000] * 70  # ~10 frames of SNAC
         profiler.record("TTS_GEN", gen_time, 10 / 6.86)
-        return [output]
+        return mock_request_output
 
     # Mock Decoder: Simulates DSP/SNAC decoding latency
     async def mocked_decode(*args, **kwargs):
+        print("🛠️ Decoder Mock Called!")
         start = time.perf_counter()
         await asyncio.sleep(SIMULATED_SNAC_LATENCY)
         dec_time = time.perf_counter() - start

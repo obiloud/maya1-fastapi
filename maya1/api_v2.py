@@ -74,6 +74,8 @@ async def lifespan(app: FastAPI): # FIXED TYPO: lifspan -> lifespan
     # This spawns the AsyncSNACProcess correctly within the lifespan
     streaming_pipeline = Maya1LongPipeline(model, prompt_builder, snac_decoder)
 
+    streaming_pipeline.pre_warm()
+
     logger.info("🚀 System fully initialized and ready for requests.")
 
     yield
@@ -290,7 +292,7 @@ async def _generate_tts_streaming(description, text, **kwargs):
             try:
                 # Use a shorter timeout if the goal is strictly a keep-alive heartbeat
                 # Cloud Run usually requires data every 10-30s
-                audio_chunk = await asyncio.wait_for(anext(stream_iter), timeout=10.0)
+                audio_chunk = await asyncio.wait_for(anext(stream_iter), timeout=30.0)
                 
                 if audio_chunk:
                     yield audio_chunk

@@ -7,6 +7,8 @@ import os
 from transformers import AutoTokenizer
 from vllm import AsyncLLMEngine, AsyncEngineArgs, SamplingParams
 import logging
+import time 
+import asyncio
 from .constants import (
     ALL_EMOTION_TAGS,
     DEFAULT_MAX_MODEL_LEN,
@@ -146,21 +148,32 @@ class Maya1Model:
         """
         request_id = f"req_{id(prompt)}"
 
-        logger.info(f"🔮 vLLM Request {request_id} submitted to engine")
+        logger.info(f"🔮 [vLLM {request_id}] Starting stream iteration...")
+        start_time = time.perf_counter()
         
-        # Collect results from async generator
-        final_output = None
-        async for output in self.engine.generate(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            request_id=request_id
-        ):
-            final_output = output
+        results_generator = self.engine.generate(prompt, sampling_params, request_id)
+        
+        try:
+            # We wrap the iteration to see exactly when the FIRST token arrives
+            first_token_received = False
+            final_output = None
+            
+            async for request_output in results_generator:
+                if not first_token_received:
+                    ttft = time.perf_counter() - start_time
+                    logger.info(f"⚡ [vLLM {request_id}] TTFT: {ttft:.2f}s")
+                    first_token_received = True
+                
+                final_output = request_output
+                
+                # Yield control back to the event loop to let the watchdog bark
+                await asyncio.sleep(0) 
 
-        logger.info(f"✅ vLLM Request {request_id} completed")
+            return [final_output]
+        except Exception as e:
+            logger.error(f"❌ [vLLM {request_id}] Error during generation: {e}")
+            raise
 
-        return [final_output] if final_output else []
-    
     async def generate_stream(self, prompt: str, sampling_params: SamplingParams):
         """
         Generate tokens from prompt (streaming).

@@ -37,6 +37,8 @@ ENV VLLM_TORCH_CUDA_ARCH_LIST="8.9"
 ENV HF_HUB_OFFLINE=1 
 ENV PYTHONUNBUFFERED=1
 ENV TOKENIZERS_PARALLELISM=false
+ENV OMP_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
 
 # 4. Install Python dependencies (Changes occasionally)
 # Copying only requirements.txt first to leverage cache

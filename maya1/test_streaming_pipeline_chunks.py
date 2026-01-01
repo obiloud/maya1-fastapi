@@ -42,21 +42,23 @@ async def test_pipeline_bottlenecks():
     mock_builder.build_prefix.return_value = "prompt"
     
     # Mock Model: Simulates token generation latency
-    async def mocked_generate(*args, **kwargs):
+    async def mocked_generate_stream(*args, **kwargs):
         start = time.perf_counter()
-        await asyncio.sleep(SIMULATED_TTS_LATENCY)
+        await asyncio.sleep(0.05) 
         gen_time = time.perf_counter() - start
         
-        # Create the nested structure vLLM expects
-        mock_request_output = MagicMock()
-        # This makes outputs[0] work
-        mock_request_output.__getitem__.return_value = mock_request_output 
-        # This makes outputs[0].outputs[0] work
-        token_ids = [CODE_START_TOKEN_ID] + ([SNAC_MAX_ID] * 70) + [CODE_END_TOKEN_ID]
-        mock_request_output.outputs = [MagicMock(token_ids=token_ids)]
-        # Return dummy vLLM output structure
-        profiler.record("TTS_GEN", gen_time, 10 / 6.86)
-        return mock_request_output
+        # Simulate 10 frames of audio arriving in 2-frame bursts
+        total_audio_tokens = [CODE_START_TOKEN_ID] + ([SNAC_MAX_ID] * 70)
+        
+        for burst_idx in range(1, 6):
+            current_limit = burst_idx * 14 # 14, 28, 42...
+            mock_output = MagicMock()
+            # vLLM always returns the CUMULATIVE list of tokens
+            mock_output.outputs = [MagicMock(token_ids=total_audio_tokens[:current_limit])]
+            yield mock_output
+            await asyncio.sleep(0.01) # Simulate network/processing jitter
+            profiler.record("TTS_GEN", gen_time, 10 / 6.86)
+            
 
     # Mock Decoder: Simulates DSP/SNAC decoding latency
     async def mocked_decode(*args, **kwargs):
@@ -70,7 +72,7 @@ async def test_pipeline_bottlenecks():
         profiler.record("SNAC_DECODE", dec_time, audio_sec)
         return b'\x00' * int(SAMPLE_RATE * 2 * audio_sec)
 
-    mock_model.generate = mocked_generate
+    mock_model.generate_stream = mocked_generate_stream
     mock_decoder.decode_single_async = mocked_decode
 
     # 2. Initialize Pipeline

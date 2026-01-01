@@ -74,7 +74,7 @@ async def lifespan(app: FastAPI): # FIXED TYPO: lifspan -> lifespan
     # This spawns the AsyncSNACProcess correctly within the lifespan
     streaming_pipeline = Maya1LongPipeline(model, prompt_builder, snac_decoder)
 
-    streaming_pipeline.pre_warm()
+    await streaming_pipeline.pre_warm()
 
     logger.info("🚀 System fully initialized and ready for requests.")
 

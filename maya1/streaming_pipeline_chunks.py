@@ -13,6 +13,8 @@ from .constants import (
     CODE_END_TOKEN_ID,
     SNAC_MIN_ID,
     SNAC_MAX_ID,
+    SOA_ID,
+    SOH_ID,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     DEFAULT_MAX_TOKENS,
@@ -100,133 +102,118 @@ class Maya1LongPipeline:
                     
         return pipeline_items
 
-    def _extract_snac_codes(self, token_ids: List[int]) -> List[int]:
+    def _extract_snac_codes_streaming(self, raw_tokens: List[int]):
         """
-        Extracts SNAC codes within the specific CODE_START and CODE_END markers,
-        ensuring all tokens fall within the valid SNAC_MIN/MAX range.
+        Returns (list_of_codes, total_raw_tokens_consumed)
+        Handles skipping start tags and aligning to 7-token frames.
         """
-        # 1. Handle potential Mock objects in tests
-        # If token_ids is a MagicMock, it won't support .index(). 
-        # We convert to a list or handle the Mock gracefully.
-        if hasattr(token_ids, "__getitem__") and not isinstance(token_ids, list):
-            try:
-                token_ids = list(token_ids)
-            except Exception:
-                logger.warning("token_ids is a Mock that cannot be converted to list.")
-                return []
+        if not raw_tokens:
+            return [], 0
 
-        # 2. Find Start Marker (SOS)
-        try:
-            # Start looking from the beginning
-            sos_idx = token_ids.index(CODE_START_TOKEN_ID)
-            start_from = sos_idx + 1
-        except (ValueError, AttributeError):
-            # Fallback for mocks/incomplete streams: start from 0
-            start_from = 0
+        valid_audio_codes = []
+        raw_consumed = 0
         
-        # 3. Find End Marker (EOS)
-        try:
-            # Only look for EOS *after* the SOS
-            eos_idx = token_ids.index(CODE_END_TOKEN_ID, start_from)
-        except (ValueError, AttributeError):
-            # If no EOS, take everything to the end
-            eos_idx = len(token_ids)
-        
-        # 4. Range Extraction
-        snac_tokens = token_ids[start_from:eos_idx]
-        
-        # 5. Strict Validation & Integer Filtering
-        # This prevents the ">=" TypeError by ensuring we only compare real ints
-        snac_codes = []
-        for t in snac_tokens:
-            try:
-                # Ensure t is an int (handles cases where Mock returns Mocks)
-                val = int(t) 
-                if SNAC_MIN_ID <= val <= SNAC_MAX_ID:
-                    snac_codes.append(val)
-            except (ValueError, TypeError):
+        for token in raw_tokens:
+            # 1. Skip metadata/start tags but mark them as consumed
+            if token == CODE_START_TOKEN_ID:
+                raw_consumed += 1
                 continue
+                
+            # 2. Stop at end markers
+            if token == CODE_END_TOKEN_ID:
+                raw_consumed += 1
+                break
+                
+            # 3. Collect valid SNAC audio codes
+            if SNAC_MIN_ID <= token <= SNAC_MAX_ID:
+                valid_audio_codes.append(token)
+                raw_consumed += 1
+            else:
+                # Consume unknown/emotion tokens to move the stream forward
+                raw_consumed += 1
 
-        # 6. Alignment Check
-        # SNAC requires 7 tokens per frame. We trim any trailing partial frames
-        # to avoid the sliding window getting misaligned.
-        num_frames = len(snac_codes) // 7
-        if num_frames == 0 and len(snac_codes) > 0:
-            logger.debug(f"Received {len(snac_codes)} tokens, but not enough for a full SNAC frame.")
+        # 4. Alignment: We can only yield multiples of 7
+        num_frames = len(valid_audio_codes) // 7
+        final_codes = valid_audio_codes[:num_frames * 7]
         
-        return snac_codes[:num_frames * 7]
-
-    async def fetch_audio_manager(self, audio_queue, description: str, pipeline_items: List[PipelineItem], **kwargs):
-        logger.info("🚀 Producer Started")
-
+        # IMPORTANT: If we didn't use some audio tokens because they didn't 
+        # form a full frame, we "un-consume" them from the raw count 
+        # so they appear in the next slice.
+        unused_audio_count = len(valid_audio_codes) % 7
+        final_raw_consumed = raw_consumed - unused_audio_count
+        
+        return final_codes, final_raw_consumed
+    
+    async def decoder_worker(self, decode_queue, audio_queue):
         # sliding window configuration
         TOKENS_PER_FRAME = 7
         WINDOW_FRAMES = 4 
         WINDOW_SIZE = WINDOW_FRAMES * TOKENS_PER_FRAME # 28 tokens
 
-        # This queue allows the LLM to hand off tokens to the Decoder
-        # and immediately start the next generation call.
-        decode_queue = asyncio.Queue(maxsize=2)
-
-        async def decoder_worker():
-            token_buffer = []
-            is_first_chunk = True
+        token_buffer = []
+        is_first_chunk = True
+        
+        while True:
+            item_data = await decode_queue.get()
             
-            while True:
-                item_data = await decode_queue.get()
-                
-                # --- STOP SIGNAL & FINAL FLUSH ---
-                if item_data is None:
-                    if len(token_buffer) >= 7:
-                        logger.info(f"Final flush: {len(token_buffer)} tokens")
-                        # Use standard decode for the tail to avoid cropping end-of-speech
+            # --- STOP SIGNAL & FINAL FLUSH ---
+            if item_data is None:
+                if len(token_buffer) >= 7:
+                    logger.info(f"Final flush: {len(token_buffer)} tokens")
+                    # Use standard decode for the tail to avoid cropping end-of-speech
+                    audio_bytes = await self.snac_decoder.decode_single_async(
+                        token_buffer, 
+                        use_sliding_window=False,
+                    )
+                    if audio_bytes:
+                        await audio_queue.put(audio_bytes)
+                decode_queue.task_done()
+                break
+            
+            idx, p_item, snac_codes = item_data
+            
+            try:
+                if p_item.type == 'pause':
+                    token_buffer = [] # Reset buffer on pause
+                    await audio_queue.put(generate_silent_bytes(p_item.duration))
+                else:
+                    token_buffer.extend(snac_codes)
+                    logger.info(f"Buffer size: {len(token_buffer)}")
+
+                    # --- FAST PATH: Get sound playing immediately ---
+                    if is_first_chunk and len(token_buffer) >= 7:
+                        first_frame = token_buffer[:7]
                         audio_bytes = await self.snac_decoder.decode_single_async(
-                            token_buffer, 
-                            use_sliding_window=False,
+                            first_frame, use_sliding_window=False, trim_warmup=True
                         )
                         if audio_bytes:
                             await audio_queue.put(audio_bytes)
-                    decode_queue.task_done()
-                    break
-                
-                idx, p_item, snac_codes = item_data
-                
-                try:
-                    if p_item.type == 'pause':
-                        token_buffer = [] # Reset buffer on pause
-                        await audio_queue.put(generate_silent_bytes(p_item.duration))
-                    else:
-                        token_buffer.extend(snac_codes)
-                        logger.info(f"Buffer size: {len(token_buffer)}")
+                        token_buffer = token_buffer[7:]
+                        is_first_chunk = False
 
-                        # --- FAST PATH: Get sound playing immediately ---
-                        if is_first_chunk and len(token_buffer) >= 7:
-                            first_frame = token_buffer[:7]
-                            audio_bytes = await self.snac_decoder.decode_single_async(
-                                first_frame, use_sliding_window=False, trim_warmup=True
-                            )
-                            if audio_bytes:
-                                await audio_queue.put(audio_bytes)
-                            token_buffer = token_buffer[7:]
-                            is_first_chunk = False
+                    # --- SLIDING WINDOW: Smooth continuous playback ---
+                    while len(token_buffer) >= WINDOW_SIZE:
+                        window = token_buffer[:WINDOW_SIZE]
+                        audio_bytes = await self.snac_decoder.decode_single_async(
+                            window, use_sliding_window=True
+                        )
+                        if audio_bytes:
+                            await audio_queue.put(audio_bytes)
+                        
+                        token_buffer = token_buffer[TOKENS_PER_FRAME:]
+                        await asyncio.sleep(0) # Keep event loop alive
+                    logger.info(f"✅ Decoder: Chunk {idx} processed into window stream")
+            finally:
+                decode_queue.task_done()
 
-                        # --- SLIDING WINDOW: Smooth continuous playback ---
-                        while len(token_buffer) >= WINDOW_SIZE:
-                            window = token_buffer[:WINDOW_SIZE]
-                            audio_bytes = await self.snac_decoder.decode_single_async(
-                                window, use_sliding_window=True
-                            )
-                            if audio_bytes:
-                                await audio_queue.put(audio_bytes)
-                            
-                            token_buffer = token_buffer[TOKENS_PER_FRAME:]
-                            await asyncio.sleep(0) # Keep event loop alive
-                        logger.info(f"✅ Decoder: Chunk {idx} processed into window stream")
-                finally:
-                    decode_queue.task_done()
+    async def fetch_audio_manager(self, audio_queue, description: str, pipeline_items: List[PipelineItem], **kwargs):
+        logger.info("🚀 Producer Started")
 
+        # This queue allows the LLM to hand off tokens to the Decoder
+        # and immediately start the next generation call.
+        decode_queue = asyncio.Queue(maxsize=2)
         # 1. Start the Decoder worker in the background
-        worker_task = asyncio.create_task(decoder_worker())
+        worker_task = asyncio.create_task(self.decoder_worker(decode_queue, audio_queue))
 
         def handle_worker_result(task):
             try:
@@ -238,35 +225,44 @@ class Maya1LongPipeline:
 
         try:
             # 2. PRODUCER LOOP: Focus only on the LLM (The Bottleneck)
-            for i, item in enumerate(pipeline_items):
-                logger.info(f"📦 Producer: Processing item {i}")
-
+            for i, item in enumerate(pipeline_items):                
                 if item.type == 'pause':
                     await decode_queue.put((i, item, None))
-                    continue
+                else:
+                    logger.info(f"📦 Producer: Processing item {i}")
 
-                prompt = self.prompt_builder.build_prefix(description, item.content)
+                    # vllm_pointer must be absolute to the cumulative list provided by vLLM
+                    vllm_pointer = 0
+                    prompt = self.prompt_builder.build_prefix(description, item.content)
 
-                sampling_params = SamplingParams(
-                    temperature=kwargs.get("temperature", DEFAULT_TEMPERATURE),
-                    top_p=kwargs.get("top_p", DEFAULT_TOP_P),
-                    max_tokens=kwargs.get("max_tokens", DEFAULT_MAX_TOKENS),
-                    min_tokens=kwargs.get("min_tokens", DEFAULT_MIN_TOKENS),
-                    stop_token_ids=[CODE_END_TOKEN_ID],
-                )
-                
-                # This is your 0.5s stage
-                start_inference = time.perf_counter()
-                outputs = await self.model.generate(prompt, sampling_params)
-                end_inference = time.perf_counter()
-                logger.info(f"⏱️ Inference for item {i} took {end_inference - start_inference:.2f}s")
-                
-                if outputs:
-                    snac_codes = self._extract_snac_codes(outputs[0].outputs[0].token_ids)
-                    # HAND OFF to the worker and IMMEDIATELY loop back to 'model.generate'
-                    await decode_queue.put((i, item, snac_codes))
-                    logger.info(f"📦 Producer: item {i} SNAC codes handed off")
-            
+                    sampling_params = SamplingParams(
+                        temperature=kwargs.get("temperature", DEFAULT_TEMPERATURE),
+                        top_p=kwargs.get("top_p", DEFAULT_TOP_P),
+                        max_tokens=kwargs.get("max_tokens", DEFAULT_MAX_TOKENS),
+                        min_tokens=kwargs.get("min_tokens", DEFAULT_MIN_TOKENS),
+                        stop_token_ids=[CODE_END_TOKEN_ID],
+                    )
+                    
+                    start_inference = time.perf_counter()
+                    async for request_output in self.model.generate_stream(prompt, sampling_params):
+                        all_tokens = request_output.outputs[0].token_ids
+
+                        # Only take the new tokens generated in this step
+                        new_tokens = all_tokens[vllm_pointer:]
+
+                        # Extract codes (handles alignment and SOS/EOS)
+                        snac_codes, raw_consumed = self._extract_snac_codes_streaming(new_tokens)
+                        
+                        # We need at least 7 tokens for a single SNAC frame
+                        if len(snac_codes) >= 7:
+                            await decode_queue.put((i, item, snac_codes))
+                            logger.info(f"📦 {len(snac_codes)} SNAC codes handed off.")
+                                
+                        vllm_pointer += raw_consumed
+                    
+                    end_inference = time.perf_counter()
+                    logger.info(f"⏱️ Producer: Inference for item {i} took {end_inference - start_inference:.2f}s.")
+                    
             # 3. Wait for the background worker to finish all hand-offs
             await decode_queue.join()
             logger.info("🏁 Producer: All items finished")

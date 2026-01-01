@@ -55,7 +55,7 @@ class SNACDecoder:
 
         if device == "cpu":
             torch.set_num_threads(4)
-            torch.set_interop_op_num_threads(2)
+            torch.set_num_interop_threads(2)
             torch.set_grad_enabled(False)
 
             if hasattr(torch, 'set_flush_denormal'):

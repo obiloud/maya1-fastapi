@@ -185,10 +185,24 @@ class Maya1Model:
         """
         request_id = f"req_{id(prompt)}"
         
+        logger.info(f"🔮 [vLLM {request_id}] Starting stream iteration...")
+        start_time = time.perf_counter()
+
+        results_generator = self.engine.generate(prompt, sampling_params, request_id)
+        
         # Stream from engine
-        async for output in self.engine.generate(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            request_id=request_id
-        ):
-            yield output
+        try:
+            first_token_received = False
+
+            async for output in results_generator:
+                if not first_token_received:
+                    ttft = time.perf_counter() - start_time
+                    logger.info(f"⚡ [vLLM {request_id}] TTFT: {ttft:.2f}s")
+                    first_token_received = True
+                yield output
+                
+                # Yield control back to the event loop to let the watchdog bark
+                await asyncio.sleep(0) 
+        except Exception as e:
+            logger.error(f"❌ [vLLM {request_id}] Error during generation: {e}")
+            raise

@@ -7,6 +7,7 @@ from .utils import recursive_word_chunker, parse_pause_tags, generate_silent_byt
 import asyncio
 from dataclasses import dataclass
 import time
+from collections import Counter
 
 from .constants import (
     CODE_START_TOKEN_ID,
@@ -202,7 +203,7 @@ class Maya1LongPipeline:
                         
                         token_buffer = token_buffer[TOKENS_PER_FRAME:]
                         await asyncio.sleep(0) # Keep event loop alive
-                    logger.info(f"✅ Decoder: Chunk {idx} processed into window stream")
+                    # logger.info(f"✅ Decoder: Chunk {idx} processed into window stream")
             finally:
                 decode_queue.task_done()
 
@@ -240,6 +241,7 @@ class Maya1LongPipeline:
                         top_p=kwargs.get("top_p", DEFAULT_TOP_P),
                         max_tokens=kwargs.get("max_tokens", DEFAULT_MAX_TOKENS),
                         min_tokens=kwargs.get("min_tokens", DEFAULT_MIN_TOKENS),
+                        repetition_penalty=kwargs.get('repetition_penalty', DEFAULT_REPETITION_PENALTY),
                         stop_token_ids=[CODE_END_TOKEN_ID],
                     )
                     
@@ -250,15 +252,35 @@ class Maya1LongPipeline:
                         # Only take the new tokens generated in this step
                         new_tokens = all_tokens[vllm_pointer:]
 
+                        if new_tokens:
+                            counts = Counter(new_tokens)
+                            # Get the top 3 most frequent tokens
+                            top_tokens = counts.most_common(3)
+                            
+                            # Calculate "Burst Density"
+                            # If one token is > 80% of the burst, it's a guaranteed audio artifact
+                            most_common_id, freq = top_tokens[0]
+                            density = freq / len(new_tokens)
+                            
+                            if density > 0.8 and len(new_tokens) > 7:
+                                logger.warning(
+                                    f"⚠️ STUCK STREAM: Token {most_common_id} occupies {density:.0%} "
+                                    f"of the burst ({freq}/{len(new_tokens)} tokens)."
+                                )
+                            
+                            # Log the IDs to see if they are SNAC (1000-12000) or Tags (13000+)
+                            logger.debug(f"Burst Top Tokens: {top_tokens}")
+
                         # Extract codes (handles alignment and SOS/EOS)
                         snac_codes, raw_consumed = self._extract_snac_codes_streaming(new_tokens)
                         
                         # We need at least 7 tokens for a single SNAC frame
                         if len(snac_codes) >= 7:
                             await decode_queue.put((i, item, snac_codes))
-                            logger.info(f"📦 {len(snac_codes)} SNAC codes handed off.")
+                            # logger.info(f"📦 {len(snac_codes)} SNAC codes handed off.")
                                 
                         vllm_pointer += raw_consumed
+                        logger.debug(f"vllm_pointer {vllm_pointer}")
                     
                     end_inference = time.perf_counter()
                     logger.info(f"⏱️ Producer: Inference for item {i} took {end_inference - start_inference:.2f}s.")

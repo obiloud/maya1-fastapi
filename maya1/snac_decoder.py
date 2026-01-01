@@ -207,6 +207,9 @@ class SNACDecoder:
         # Extract audio (remove padding if any)
         # SNAC decoder outputs: [batch, 1, samples]
         audio = audio[0, 0].cpu().numpy()
+
+        # Inside decoder_worker or SNACDecoder
+        logger.info(f"🔍 Audio Stats: Len={len(audio)} | Shape={audio.shape if hasattr(audio, 'shape') else 'Bytes'}")
         
         # Sliding window mode: only keep middle 2048 samples
         # This eliminates popping/cracking when using overlapping 28-token windows

@@ -254,7 +254,7 @@ class SNACDecoder:
 
         audio = self.decode(snac_tokens, trim_warmup=trim_warmup, use_sliding_window=use_sliding_window)
         
-        logger.info(f"🧵 Threaded SNAC Decode: {len(snac_tokens)} tokens -> {time.perf_counter()-start:.3f}s")
+        logger.debug(f"🧵 Threaded SNAC Decode: {len(snac_tokens)} tokens -> {time.perf_counter()-start:.3f}s")
         
         if audio is None:
             return None

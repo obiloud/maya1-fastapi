@@ -105,52 +105,77 @@ class Maya1Pipeline:
     def _extract_snac_codes_streaming(self, raw_tokens: List[int]):
         """
         Returns (list_of_codes, total_raw_tokens_consumed)
-        Handles skipping start tags and aligning to 7-token frames.
+        Robustly tracks the exact index of the last consumed audio token.
         """
         if not raw_tokens:
             return [], 0
 
         valid_audio_codes = []
-        raw_consumed = 0
         
-        for token in raw_tokens:
-            # 1. Skip metadata/start tags but mark them as consumed
+        # We track the index in 'raw_tokens' that corresponds to the 
+        # last audio token we successfully added to a full frame.
+        last_consumed_raw_index = -1 
+        
+        # Temporary list to hold indices of audio tokens for the current batch
+        current_audio_indices = []
+
+        for i, token in enumerate(raw_tokens):
+            # 1. Skip start tags
             if token == CODE_START_TOKEN_ID:
-                raw_consumed += 1
                 continue
                 
             # 2. Stop at end markers
             if token == CODE_END_TOKEN_ID:
-                raw_consumed += 1
+                # If we hit END, we should consume everything up to here
+                # regardless of whether we have a full frame, or handle as needed.
+                # For now, let's just break and return what we have.
+                last_consumed_raw_index = i
                 break
                 
             # 3. Collect valid SNAC audio codes
             if SNAC_MIN_ID <= token <= SNAC_MAX_ID:
                 valid_audio_codes.append(token)
-                raw_consumed += 1
+                current_audio_indices.append(i)
             else:
-                # Consume unknown/emotion tokens to move the stream forward
-                raw_consumed += 1
+                # It's a text/emotion token. We implicitly "consume" it 
+                # if we move past it, but we don't add it to audio codes.
+                pass
 
         # 4. Alignment: We can only yield multiples of 7
         num_frames = len(valid_audio_codes) // 7
         final_codes = valid_audio_codes[:num_frames * 7]
         
-        # IMPORTANT: If we didn't use some audio tokens because they didn't 
-        # form a full frame, we "un-consume" them from the raw count 
-        # so they appear in the next slice.
-        unused_audio_count = len(valid_audio_codes) % 7
-        final_raw_consumed = raw_consumed - unused_audio_count
-        
+        if num_frames > 0:
+            # The index of the last audio token used in the final frame
+            # is at index (num_frames * 7) - 1 in our tracking list.
+            last_audio_idx_in_valid = (num_frames * 7) - 1
+            
+            # Map this back to the index in 'raw_tokens'
+            last_consumed_raw_index = current_audio_indices[last_audio_idx_in_valid]
+            
+            # We consumed everything up to and including that token
+            # plus 1 to make it a count (pointer delta)
+            final_raw_consumed = last_consumed_raw_index + 1
+        else:
+            # If we didn't form a single frame, we consume NOTHING 
+            # (unless we want to skip non-audio headers, but safe to wait).
+            final_raw_consumed = 0
+            
+            # Optimization: If the buffer is getting huge (>50) and no frames, 
+            # we might want to force-skip the junk, but typically unnecessary.
+
         return final_codes, final_raw_consumed
     
     async def decoder_worker(self, decode_queue, audio_queue):
         # sliding window configuration
         TOKENS_PER_FRAME = 7
         WINDOW_FRAMES = 4 
-        WINDOW_SIZE = WINDOW_FRAMES * TOKENS_PER_FRAME # 28 tokens
+        # We need 7 history + 7 target + 14 lookahead = 28 tokens
+        WINDOW_SIZE = 28 
+        MIDDLE_SAMPLES = 2048
 
         token_buffer = []
+        history_buffer = []
         is_first_chunk = True
         loop = asyncio.get_running_loop()
         
@@ -180,7 +205,7 @@ class Maya1Pipeline:
             try:
                 async with self.decode_lock:
                     if p_item.type == 'pause':
-                        token_buffer = [] # Reset buffer on pause
+                        token_buffer, history_buffer = [], [] # Reset buffer on pause
                         await audio_queue.put(generate_silent_bytes(p_item.duration))
                     else:
                         token_buffer.extend(snac_codes)
@@ -193,6 +218,8 @@ class Maya1Pipeline:
                             logger.info(f"🚀 FAST PATH: Tokens {first_frame[:3]}... | Buffer: {len(token_buffer)}")
 
                             token_buffer = token_buffer[TOKENS_PER_FRAME:]
+                            # Add to history so next window can "look back" at this
+                            history_buffer.extend(first_frame)
                             is_first_chunk = False
 
                             # Offload to process pool
@@ -209,28 +236,34 @@ class Maya1Pipeline:
                                 await audio_queue.put(audio_bytes)
 
                         # --- SLIDING WINDOW: Smooth continuous playback ---
-                        while len(token_buffer) >= WINDOW_SIZE:
-                            window = token_buffer[:WINDOW_SIZE]
+                        while len(token_buffer) >= 21 and len(history_buffer) >= 7:
+                            # 1. Build Window: [History (7)] + [Target (7)] + [Lookahead (14)]
+                            lead_in = history_buffer[-7:]
+                            target = token_buffer[:7]
+                            look_ahead = token_buffer[7:21]
+                            
+                            window = lead_in + target + look_ahead
+                            
+                            # 2. Advance State
+                            history_buffer.extend(target) # Target becomes history
+                            token_buffer = token_buffer[7:] # Consume target
 
-                            logger.info(f"🪟 WINDOW: Tokens {window[:3]}... | Buffer: {len(token_buffer)}")
-
-                            # Advance the buffer BEFORE the await to prevent re-processing
-                            token_buffer = token_buffer[TOKENS_PER_FRAME:]
-
-                            # Parallelize decoding!
+                            # 3. Decode
                             audio_bytes = await loop.run_in_executor(
                                 self.executor,
-                                functools.partial(
-                                    worker_decode_task,
-                                    window,
-                                    use_sliding_window=True,
-                                    trim_warmup=False
-                                )
+                                functools.partial(worker_decode_task, window, False)
                             )
-                            if audio_bytes:
-                                await audio_queue.put(audio_bytes)
                             
-                    logger.debug(f"✅ Decoder: Chunk {idx} processed into window stream")
+                            # 4. Extract Correct Middle Samples
+                            # Since we padded with 1 frame of history, our target audio 
+                            # starts exactly at sample 2048 (byte 4096).
+                            if audio_bytes and len(audio_bytes) >= 8192:
+                                # Extract samples 2048-4096 (The 2nd Frame)
+                                # This corresponds exactly to the 'target' tokens
+                                chunk = audio_bytes[4096:8192] 
+                                await audio_queue.put(chunk)
+                            
+                    logger.debug(f"✅ Decoder: Text chunk {idx} processed into window stream")
             finally:
                 decode_queue.task_done()
 
@@ -304,10 +337,9 @@ class Maya1Pipeline:
                         # We need at least 7 tokens for a single SNAC frame
                         if len(snac_codes) >= 7:
                             await decode_queue.put((i, item, snac_codes))
-                            # logger.info(f"📦 {len(snac_codes)} SNAC codes handed off.")
+                            logger.debug(f"📦 {len(snac_codes)} SNAC codes handed off.")
                                 
                         vllm_pointer += raw_consumed
-                        logger.debug(f"vllm_pointer {vllm_pointer}")
                     
                     end_inference = time.perf_counter()
                     logger.info(f"⏱️ Producer: Inference for item {i} took {end_inference - start_inference:.2f}s.")

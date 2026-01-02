@@ -15,7 +15,7 @@ from .constants import (
     SOH_ID, EOH_ID, SOA_ID, BOS_ID, TEXT_EOT_ID, CODE_START_TOKEN_ID,
 )
 
-logger = logging.getLogger('vLLM')
+logger = logging.getLogger(__name__)
 
 class Maya1Model:
     """Maya1 TTS Model with vLLM inference engine."""
@@ -49,8 +49,8 @@ class Maya1Model:
         self.model_path = model_path
         self.dtype = dtype
         
-        print(f"Initializing Maya1 Model")
-        print(f"Model: {model_path}")
+        logger.info(f"Initializing Maya1 Model")
+        logger.debug(f"Model: {model_path}")
         
         trust_remote_code=True
         if './' in model_path:
@@ -63,7 +63,7 @@ class Maya1Model:
             trust_remote_code=trust_remote_code,
         )
         
-        print(f"Tokenizer loaded: {len(self.tokenizer)} tokens")
+        logger.info(f"Tokenizer loaded: {len(self.tokenizer)} tokens")
         
         # Validate emotion tags
         self._validate_emotion_tags()
@@ -72,7 +72,7 @@ class Maya1Model:
         self._init_special_tokens()
         
         # Initialize vLLM engine
-        print(f"Initializing vLLM engine...")
+        logger.info(f"Initializing vLLM engine...")
         engine_args = AsyncEngineArgs(
             model=model_path,
             tokenizer=model_path,
@@ -92,7 +92,7 @@ class Maya1Model:
         
         self.engine = AsyncLLMEngine.from_engine_args(engine_args)
         
-        print(f"Maya1 Model ready\n")
+        logger.info(f"Maya1 Model ready\n")
     
     def _validate_emotion_tags(self):
         """Validate that all 20 emotion tags are single tokens."""
@@ -103,10 +103,10 @@ class Maya1Model:
                 failed_tags.append((tag, len(token_ids)))
         
         if failed_tags:
-            print(f"ERROR: {len(failed_tags)} emotion tags are NOT single tokens!")
+            logger.error(f"ERROR: {len(failed_tags)} emotion tags are NOT single tokens!")
             raise AssertionError(f"Emotion tags validation failed")
         
-        print(f"All {len(ALL_EMOTION_TAGS)} emotion tags validated")
+        logger.info(f"All {len(ALL_EMOTION_TAGS)} emotion tags validated")
     
     def _init_special_tokens(self):
         """Precompute special token strings ensuring no hidden prefix/suffix."""

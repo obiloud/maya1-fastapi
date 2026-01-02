@@ -1,6 +1,31 @@
-import multiprocessing as mp
 import logging
-import logging.handlers
+
+def get_logging_config(log_level_str):
+    return {
+        'version': 1,
+        'disable_existing_loggers': False,
+        'loggers': {
+            '': {  # Root logger
+                'level': 'WARNING',
+                'handlers': ['console'],
+            },
+            'api_v2': {  # Specific level for your code
+                'level': log_level_str,
+                'propagate': True,
+            },
+        },
+        'handlers': {
+            'console': {
+                'class': 'logging.StreamHandler',
+                'formatter': 'standard',
+            },
+        },
+        'formatters': {
+            'standard': {
+                'format': '%(name)s - %(levelname)s - %(message)s',
+            },
+        },
+    }
 
 def setup_child_logging(queue):
     """Configures a child process to send all logs to the main process via a Queue."""

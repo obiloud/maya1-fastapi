@@ -4,7 +4,7 @@ import time
 import numpy as np
 from unittest.mock import AsyncMock, MagicMock
 from dataclasses import dataclass
-from .streaming_pipeline_chunks import Maya1LongPipeline
+from .maya1_pipeline import Maya1Pipeline
 from .worker import MockSNACDecoder
 from .constants import CODE_START_TOKEN_ID, SNAC_MAX_ID
 
@@ -56,7 +56,7 @@ async def test_pipeline_bottlenecks():
     mock_model.generate_stream = mocked_generate_stream
     
     # 2. Initialize Pipeline
-    pipeline = Maya1LongPipeline(
+    pipeline = Maya1Pipeline(
         model=mock_model, 
         prompt_builder=mock_builder, 
         snac_decoder_class=MockSNACDecoder,

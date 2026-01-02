@@ -13,10 +13,12 @@ import sys
 import logging
 import multiprocessing as mp
 from contextlib import asynccontextmanager
+import google.cloud.logging
 
+from .logging import get_logging_config
 from .model_loader import Maya1Model
 from .prompt_builder import Maya1PromptBuilder
-from .streaming_pipeline_chunks import Maya1LongPipeline
+from .maya1_pipeline import Maya1Pipeline
 from .snac_decoder import SNACDecoder
 from .constants import (
     DEFAULT_TEMPERATURE,
@@ -24,6 +26,7 @@ from .constants import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_REPETITION_PENALTY,
     AUDIO_SAMPLE_RATE,
+    MAX_WORDS_PER_CHUNK,
 )
 
 # Timeout settings (seconds)
@@ -31,21 +34,18 @@ GENERATE_TIMEOUT = 60
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# Imports the Cloud Logging client library
-import google.cloud.logging
+log_level_str = os.environ.get('LOG_LEVEL', 'WARNING').upper()
+log_level = getattr(logging, log_level_str, logging.WARNING)
+logging.config.dictConfig(get_logging_config(log_level_str))
 
-# Instantiates a client
+# Initialize the Cloud Logging client
 client = google.cloud.logging.Client()
 
-# Retrieves a Cloud Logging handler based on the environment
-# you're running in and integrates the handler with the
-# Python logging module. By default this captures all logs
-# at INFO level and higher
-client.setup_logging()
+# Captures all logs from the root logger at INFO level and higher
+client.setup_logging(log_level=log_level)
 
-logging.basicConfig(level=logging.DEBUG)
 
-logger = logging.getLogger("api_v2")
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -79,7 +79,7 @@ async def lifespan(app: FastAPI): # FIXED TYPO: lifspan -> lifespan
 
     prompt_builder = Maya1PromptBuilder(model.tokenizer, model)
 
-    streaming_pipeline = Maya1LongPipeline(model, prompt_builder, SNACDecoder, device="cpu")
+    streaming_pipeline = Maya1Pipeline(model, prompt_builder, SNACDecoder, device="cpu")
 
     logger.info("🚀 System fully initialized and ready for requests.")
 
@@ -179,6 +179,10 @@ class TTSRequest(BaseModel):
         default=False,
         description="Stream audio (True) or return complete WAV (False)"
     )
+    max_word_per_chunk: Optional[int] = Field(
+        default=MAX_WORDS_PER_CHUNK,
+        description="Stream audio (True) or return complete WAV (False)"
+    )
 
 
 # ============================================================================
@@ -229,6 +233,7 @@ async def generate_tts(request: TTSRequest):
                 max_tokens=request.max_tokens,
                 repetition_penalty=request.repetition_penalty,
                 seed=request.seed,
+                max_words_per_chunk=request.max_word_per_chunk
             )
         else:
             return await _generate_tts_complete(
@@ -239,6 +244,7 @@ async def generate_tts(request: TTSRequest):
                 max_tokens=request.max_tokens,
                 repetition_penalty=request.repetition_penalty,
                 seed=request.seed,
+                max_words_per_chunk=request.max_word_per_chunk
             )
     
     except HTTPException:

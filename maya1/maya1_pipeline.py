@@ -25,6 +25,7 @@ from .constants import (
     DEFAULT_MIN_TOKENS,
     DEFAULT_REPETITION_PENALTY,
     DEFAULT_SEED,
+    MAX_WORDS_PER_CHUNK,
 )
 
 RATE = 2400
@@ -38,10 +39,9 @@ BYTES_PER_SEC = RATE * 2 * CHANNELS
 MIN_START_BYTES = BYTES_PER_SEC * BUFFER_DURATION_SEC 
 
 CROSSFADE_SAMPLES = 1200
-MAX_WORDS_PER_CHUNK = 60
 DESCRIPTION_DEFAULT = "Realistic male voice in the 40s with British accent. Low pitch, mellow timbre, slow pacing."
 
-logger = logging.getLogger('streamin_pipeline')
+logger = logging.getLogger(__name__)
 
 @dataclass
 class PipelineItem:
@@ -49,7 +49,7 @@ class PipelineItem:
     content: Optional[str]
     duration: Optional[float]
 
-class Maya1LongPipeline:
+class Maya1Pipeline:
     
     def __init__(self, model, prompt_builder, snac_decoder_class=None, **decoder_kwargs):
         """
@@ -79,7 +79,7 @@ class Maya1LongPipeline:
         """Call this when the server closes."""
         self.executor.shutdown(wait=False)
 
-    def prepare_pipeline(self, text) -> List[PipelineItem]:
+    def prepare_pipeline(self, text, max_words_per_chunk) -> List[PipelineItem]:
         """
         1. Parses PAUSE tags.
         2. Chunks text segments.
@@ -96,7 +96,7 @@ class Maya1LongPipeline:
                 pipeline_items.append(PipelineItem(type="pause", content=None, duration=item))
             elif isinstance(item, str):
                 # It's text, chunk it further
-                chunks = recursive_word_chunker(item, MAX_WORDS_PER_CHUNK)
+                chunks = recursive_word_chunker(item, max_words_per_chunk)
                 for c in chunks:
                     pipeline_items.append(PipelineItem(type='text', content= re.sub(pattern=r, repl=" ", string=c), duration=None))
                     
@@ -348,7 +348,9 @@ class Maya1LongPipeline:
 
         start_time = asyncio.get_event_loop().time()
 
-        pipeline_items = self.prepare_pipeline(text)
+        max_words_per_chunk = kwargs.get('max_words_per_chunk', MAX_WORDS_PER_CHUNK)
+
+        pipeline_items = self.prepare_pipeline(text, max_words_per_chunk)
 
         producer_task = asyncio.create_task(self.fetch_audio_manager(audio_queue, description, pipeline_items, **kwargs))
 

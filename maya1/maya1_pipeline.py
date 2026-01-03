@@ -104,67 +104,40 @@ class Maya1Pipeline:
 
     def _extract_snac_codes_streaming(self, raw_tokens: List[int]):
         """
+        Optimized extraction that minimizes pointer recalculation.
         Returns (list_of_codes, total_raw_tokens_consumed)
-        Robustly tracks the exact index of the last consumed audio token.
         """
         if not raw_tokens:
             return [], 0
 
-        valid_audio_codes = []
+        # 1. Filter out only the audio codes in a single pass
+        # We use a generator expression for memory efficiency
+        audio_codes = [t for t in raw_tokens if SNAC_MIN_ID <= t <= SNAC_MAX_ID]
         
-        # We track the index in 'raw_tokens' that corresponds to the 
-        # last audio token we successfully added to a full frame.
-        last_consumed_raw_index = -1 
+        # 2. Calculate how many full 7-token frames we have
+        num_frames = len(audio_codes) // 7
         
-        # Temporary list to hold indices of audio tokens for the current batch
-        current_audio_indices = []
-
+        if num_frames == 0:
+            return [], 0
+            
+        # 3. Take exactly what we need
+        final_audio_codes = audio_codes[:num_frames * 7]
+        
+        # 4. Find the 'raw' index of the last token in the last full frame
+        # We find the index of the (num_frames * 7)-th audio token in the original list
+        audio_count = 0
+        raw_consumed = 0
+        target_count = num_frames * 7
+        
         for i, token in enumerate(raw_tokens):
-            # 1. Skip start tags
-            if token == CODE_START_TOKEN_ID:
-                continue
-                
-            # 2. Stop at end markers
-            if token == CODE_END_TOKEN_ID:
-                # If we hit END, we should consume everything up to here
-                # regardless of whether we have a full frame, or handle as needed.
-                # For now, let's just break and return what we have.
-                last_consumed_raw_index = i
+            if SNAC_MIN_ID <= token <= SNAC_MAX_ID:
+                audio_count += 1
+            
+            if audio_count == target_count:
+                raw_consumed = i + 1
                 break
                 
-            # 3. Collect valid SNAC audio codes
-            if SNAC_MIN_ID <= token <= SNAC_MAX_ID:
-                valid_audio_codes.append(token)
-                current_audio_indices.append(i)
-            else:
-                # It's a text/emotion token. We implicitly "consume" it 
-                # if we move past it, but we don't add it to audio codes.
-                pass
-
-        # 4. Alignment: We can only yield multiples of 7
-        num_frames = len(valid_audio_codes) // 7
-        final_codes = valid_audio_codes[:num_frames * 7]
-        
-        if num_frames > 0:
-            # The index of the last audio token used in the final frame
-            # is at index (num_frames * 7) - 1 in our tracking list.
-            last_audio_idx_in_valid = (num_frames * 7) - 1
-            
-            # Map this back to the index in 'raw_tokens'
-            last_consumed_raw_index = current_audio_indices[last_audio_idx_in_valid]
-            
-            # We consumed everything up to and including that token
-            # plus 1 to make it a count (pointer delta)
-            final_raw_consumed = last_consumed_raw_index + 1
-        else:
-            # If we didn't form a single frame, we consume NOTHING 
-            # (unless we want to skip non-audio headers, but safe to wait).
-            final_raw_consumed = 0
-            
-            # Optimization: If the buffer is getting huge (>50) and no frames, 
-            # we might want to force-skip the junk, but typically unnecessary.
-
-        return final_codes, final_raw_consumed
+        return final_audio_codes, raw_consumed
     
     async def decoder_worker(self, decode_queue, audio_queue):
         # sliding window configuration
@@ -237,6 +210,8 @@ class Maya1Pipeline:
 
                         # --- SLIDING WINDOW: Smooth continuous playback ---
                         while len(token_buffer) >= 21 and len(history_buffer) >= 7:
+                            is_low_buffer = (len(token_buffer) + len(history_buffer)) < (WINDOW_SIZE + 7)
+
                             # 1. Build Window: [History (7)] + [Target (7)] + [Lookahead (14)]
                             lead_in = history_buffer[-7:]
                             target = token_buffer[:7]
@@ -251,7 +226,7 @@ class Maya1Pipeline:
                             # 3. Decode
                             audio_bytes = await loop.run_in_executor(
                                 self.executor,
-                                functools.partial(worker_decode_task, window, False)
+                                functools.partial(worker_decode_task, window, False, False, is_low_buffer)
                             )
                             
                             # 4. Extract Correct Middle Samples

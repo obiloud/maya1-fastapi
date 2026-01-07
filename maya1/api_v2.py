@@ -9,9 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import asyncio
-import sys
+import json
 import logging
-import multiprocessing as mp
 from contextlib import asynccontextmanager
 import google.cloud.logging
 
@@ -50,12 +49,7 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
-if sys.platform != "win32":
-    try:
-        mp.set_start_method("spawn", force=True)
-    except RuntimeError:
-        # Method might already be set
-        pass
+snac_device = os.environ.get('SNAC_DEVICE', 'cuda')
 
 # Global state
 model = None
@@ -79,7 +73,7 @@ async def lifespan(app: FastAPI): # FIXED TYPO: lifspan -> lifespan
 
     prompt_builder = Maya1PromptBuilder(model.tokenizer, model)
 
-    streaming_pipeline = Maya1Pipeline(model, prompt_builder, SNACDecoder, device="cpu")
+    streaming_pipeline = Maya1Pipeline(model, prompt_builder, SNACDecoder, device=snac_device)
 
     logger.info("🚀 System fully initialized and ready for requests.")
 
@@ -87,7 +81,7 @@ async def lifespan(app: FastAPI): # FIXED TYPO: lifspan -> lifespan
 
     # Cleanup
     logger.info("Shutting down...")
-    streaming_pipeline.shutdown()
+    await streaming_pipeline.shutdown()
 
 
 # Initialize FastAPI app
@@ -330,6 +324,76 @@ async def _generate_tts_streaming(description, text, **kwargs):
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Content-Type-Options": "nosniff"
+        }
+    )
+
+# ============================================================================
+# Token Streaming Endpoint
+# ============================================================================
+
+@app.post("/v1/tts/tokens")
+async def generate_tts_tokens(request: TTSRequest):
+    """
+    Stream raw SNAC tokens to the client for browser-side ONNX decoding.
+    """
+    try:
+        # Note: We ignore the 'stream' flag here because this endpoint 
+        # is inherently streaming by design.
+        return await _generate_tokens_streaming_handler(
+            description=request.description,
+            text=request.text,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            max_tokens=request.max_tokens,
+            repetition_penalty=request.repetition_penalty,
+            seed=request.seed,
+            max_words_per_chunk=request.max_word_per_chunk
+        )
+    except Exception as e:
+        logger.error(f"Token Endpoint Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _generate_tokens_streaming_handler(description, text, **kwargs):
+    """
+    Wraps the pipeline generator to yield JSON-formatted token packets.
+    """
+    async def token_stream_generator():
+        stream_iter = streaming_pipeline.generate_token_stream(
+            description=description, 
+            text=text, 
+            **kwargs
+        )
+
+        while True:
+            try:
+                # Use a timeout to detect stalls and send heartbeats
+                packet = await asyncio.wait_for(anext(stream_iter), timeout=15.0)
+                
+                if packet:
+                    # Yielding as a JSON line (NDJSON format) is easiest for browsers to parse
+                    yield json.dumps(packet) + "\n"
+                    
+            except StopAsyncIteration:
+                logger.info("Token stream completed normally.")
+                break
+            except asyncio.TimeoutError:
+                # HEARTBEAT: Keeps the HTTP connection alive during long LLM inference
+                logger.info("💓 Token Stream Heartbeat triggered.")
+                yield json.dumps({"type": "heartbeat", "time": time.time()}) + "\n"
+                continue
+            except Exception as e:
+                logger.error(f"Token streaming error: {e}", exc_info=True)
+                yield json.dumps({"type": "error", "message": str(e)}) + "\n"
+                break
+    
+    return StreamingResponse(
+        token_stream_generator(), 
+        media_type="application/x-ndjson", 
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no" # Essential for Nginx/Cloud Run proxying
         }
     )
 

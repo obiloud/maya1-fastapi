@@ -1,6 +1,6 @@
 import re
 import logging
-from typing import AsyncGenerator, Optional, List
+from typing import AsyncGenerator, Optional, List, Dict, Any
 from vllm import SamplingParams
 import numpy as np
 from .utils import recursive_word_chunker, parse_pause_tags, generate_silent_bytes
@@ -11,6 +11,7 @@ from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 import functools
 from .worker import init_worker, worker_decode_task
+import json
 
 from .constants import (
     CODE_START_TOKEN_ID,
@@ -99,6 +100,7 @@ class Maya1Pipeline:
                 chunks = recursive_word_chunker(item, max_words_per_chunk)
                 for c in chunks:
                     pipeline_items.append(PipelineItem(type='text', content= re.sub(pattern=r, repl=" ", string=c), duration=None))
+                    pipeline_items.append(PipelineItem(type="pause", content=None, duration=1.0))
                     
         return pipeline_items
 
@@ -178,7 +180,6 @@ class Maya1Pipeline:
             try:
                 async with self.decode_lock:
                     if p_item.type == 'pause':
-                        token_buffer, history_buffer = [], [] # Reset buffer on pause
                         await audio_queue.put(generate_silent_bytes(p_item.duration))
                     else:
                         token_buffer.extend(snac_codes)
@@ -223,12 +224,18 @@ class Maya1Pipeline:
                             history_buffer.extend(target) # Target becomes history
                             token_buffer = token_buffer[7:] # Consume target
 
+                            start_dec = time.perf_counter()
                             # 3. Decode
                             audio_bytes = await loop.run_in_executor(
                                 self.executor,
                                 functools.partial(worker_decode_task, window, False, False, is_low_buffer)
                             )
-                            
+                            end_dec = time.perf_counter()
+
+                            latency_ms = (end_dec - start_dec) * 1000
+                            if latency_ms > 80:
+                                logger.warning(f"⚠️ High Decoding Latency: {latency_ms:.2f}ms | Buffer: {len(token_buffer)}")
+
                             # 4. Extract Correct Middle Samples
                             # Since we padded with 1 frame of history, our target audio 
                             # starts exactly at sample 2048 (byte 4096).
@@ -240,6 +247,10 @@ class Maya1Pipeline:
                             
                     logger.debug(f"✅ Decoder: Text chunk {idx} processed into window stream")
             finally:
+                logger.info(
+                    f"📊 Buffer Health: {len(token_buffer)} tokens | "
+                    f"Status: {'CRITICAL' if len(token_buffer) < 14 else 'HEALTHY'}"
+                )
                 decode_queue.task_done()
 
     async def fetch_audio_manager(self, audio_queue, description: str, pipeline_items: List[PipelineItem], **kwargs):
@@ -409,3 +420,101 @@ class Maya1Pipeline:
                 except asyncio.CancelledError:
                     pass
             logger.info(f"🔚 Generator closed. Sent {chunks_sent} chunks.")
+
+    async def generate_token_stream(
+        self, 
+        description: str, 
+        text: str, 
+        **kwargs
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Generates a stream of SNAC tokens and pause events for client-side decoding.
+        
+        Yields:
+            Dict: { "type": "tokens", "data": List[int] }
+            OR
+            Dict: { "type": "pause", "duration": float }
+        """
+        logger.info(f"📡 Starting token stream for text: {text[:50]}...")
+        
+        max_words_per_chunk = kwargs.get('max_words_per_chunk', MAX_WORDS_PER_CHUNK)
+        pipeline_items = self.prepare_pipeline(text, max_words_per_chunk)
+
+        CODE_TOKEN_OFFSET = 128266
+        try:
+            for i, item in enumerate(pipeline_items):
+                if item.type == 'pause':
+                    # Signal the client to insert a gap in playback
+                    yield {"type": "pause", "duration": item.duration}
+                    continue
+
+                logger.info(f"📦 Pipeline: Processing text chunk {i}")
+                
+                prompt = self.prompt_builder.build_prefix(description, item.content)
+                
+                sampling_params = SamplingParams(
+                    temperature=kwargs.get("temperature", DEFAULT_TEMPERATURE),
+                    top_p=kwargs.get("top_p", DEFAULT_TOP_P),
+                    max_tokens=kwargs.get("max_tokens", DEFAULT_MAX_TOKENS),
+                    min_tokens=kwargs.get("min_tokens", DEFAULT_MIN_TOKENS),
+                    repetition_penalty=kwargs.get('repetition_penalty', DEFAULT_REPETITION_PENALTY),
+                    stop_token_ids=[CODE_END_TOKEN_ID],
+                    ignore_eos=False,
+                )
+
+                start_inference = time.perf_counter()
+                
+                vllm_pointer = 0
+                snac_frame_accumulator = [] 
+                CODE_TOKEN_OFFSET = 128266
+
+                async for request_output in self.model.generate_stream(prompt, sampling_params):
+                    # Get only the newest tokens from vLLM
+                    all_token_ids = request_output.outputs[0].token_ids
+                    new_tokens = all_token_ids[vllm_pointer:]
+                    
+                    if not new_tokens:
+                        continue
+                    
+                    vllm_pointer = len(all_token_ids)
+
+                    for token in new_tokens:
+                        # Check if the token is within your SNAC range
+                        if SNAC_MIN_ID <= token <= SNAC_MAX_ID:
+                            snac_frame_accumulator.append(token)
+                            
+                            # As soon as we hit 7, ship it!
+                            if len(snac_frame_accumulator) == 7:
+                                # Re-order logic (exactly as you had it)
+                                s = snac_frame_accumulator
+                                
+                                # Unpack and un-offset
+                                l1 = [(s[0] - CODE_TOKEN_OFFSET) % 4096]
+                                l2 = [(s[1] - CODE_TOKEN_OFFSET) % 4096, (s[4] - CODE_TOKEN_OFFSET) % 4096]
+                                l3 = [
+                                    (s[2] - CODE_TOKEN_OFFSET) % 4096, (s[3] - CODE_TOKEN_OFFSET) % 4096,
+                                    (s[5] - CODE_TOKEN_OFFSET) % 4096, (s[6] - CODE_TOKEN_OFFSET) % 4096
+                                ]
+                                
+                                # Zero-latency yield
+                                yield json.dumps({"type": "tokens", "data": l1 + l2 + l3}) + "\n"
+                                
+                                logger.debug(f"📤 Sent 7 tokens (1 frame) to client.")
+
+                                snac_frame_accumulator = [] # Reset for next 85ms of audio
+                        
+                        elif token == CODE_END_TOKEN_ID:
+                            logger.info("End of audio codes detected.")
+                            break
+                        else:
+                            # Handle text/metadata (optional)
+                            pass
+
+                end_inference = time.perf_counter()
+                logger.info(f"⏱️ Inference for item {i} took {end_inference - start_inference:.2f}s.")
+
+        except Exception as e:
+            logger.error(f"❌ Token Stream CRASHED: {e}", exc_info=True)
+            yield {"type": "error", "message": str(e)}
+        finally:
+            logger.info("🏁 Token stream complete.")

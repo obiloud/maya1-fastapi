@@ -1,5 +1,9 @@
 import time
 import numpy as np
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 _worker_decoder = None
 
@@ -40,6 +44,8 @@ def worker_decode_task(tokens, use_sliding_window, trim_warmup=False, speed_up=F
         # For int16, a value around 300-500 is usually silent background noise
         SILENCE_THRESHOLD = 500 
         
+        original_len = len(audio_int16)
+
         # Look at the tail of the chunk (last ~10ms / 240 samples at 24kHz)
         tail_size = 240
         if len(audio_int16) > tail_size:
@@ -50,5 +56,10 @@ def worker_decode_task(tokens, use_sliding_window, trim_warmup=False, speed_up=F
                 # Remove the silent tail to finish this chunk faster
                 audio_int16 = audio_int16[:-tail_size]
                 # logger.debug("Speed-up: Truncated 10ms of silence")
+            
+        trimmed_samples = original_len - len(audio_int16)
+        if trimmed_samples > 0:
+            # Log this so you can see the "Time Gained"
+            logger.debug(f"⚡ Speed-up: Gained {trimmed_samples/24:.2f}ms of lead time")
 
     return audio_int16.tobytes()

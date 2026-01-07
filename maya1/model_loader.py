@@ -25,7 +25,7 @@ class Maya1Model:
         model_path: str = None,
         dtype: str = "bfloat16",
         max_model_len: int = DEFAULT_MAX_MODEL_LEN,
-        gpu_memory_utilization: float = 0.85,
+        gpu_memory_utilization: float = 0.8,
         tensor_parallel_size: int = 1,
         **engine_kwargs
     ):
@@ -74,19 +74,13 @@ class Maya1Model:
         # Initialize vLLM engine
         logger.info(f"Initializing vLLM engine...")
         engine_args = AsyncEngineArgs(
-            model=model_path,
-            tokenizer=model_path,
-            kv_cache_dtype="fp8",
-            dtype=dtype,
-            max_model_len=max_model_len,
-            gpu_memory_utilization=gpu_memory_utilization,
-            tensor_parallel_size=tensor_parallel_size,
-            trust_remote_code=trust_remote_code,
-            disable_log_stats=False, 
-            max_num_seqs=2,
-            enable_prefix_caching=True,
-            enforce_eager=True,
-            max_num_batched_tokens=512, 
+            model="./local_model/maya1-q4_k_m.gguf", # Path to the specific file
+            tokenizer="./local_model",              # Path to directory containing tokenizer.json
+            quantization="gguf",                    # Required for GGUF loading
+            kv_cache_dtype="fp8",                   # Keep this for extra memory efficiency
+            enforce_eager=True,                    # Disable eager to allow CUDA Graph optimization
+            gpu_memory_utilization=0.9,
+            max_model_len=4096,
             **engine_kwargs
         )
         

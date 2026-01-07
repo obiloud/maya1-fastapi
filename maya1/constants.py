@@ -74,7 +74,7 @@ AUDIO_BITS_PER_SAMPLE = 16
 DEFAULT_TEMPERATURE = 0.4  # Lower temp for more stable generation
 DEFAULT_TOP_P = 0.9
 DEFAULT_MAX_TOKENS = 1024 #2048  # Reasonable default for most use cases
-DEFAULT_MIN_TOKENS = 28  # At least 4 SNAC frames
+DEFAULT_MIN_TOKENS = 1 # 28  # At least 4 SNAC frames
 DEFAULT_REPETITION_PENALTY = 1.1
 DEFAULT_SEED = None  # None = random, set integer for reproducibility
 

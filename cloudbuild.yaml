@@ -11,9 +11,11 @@ steps:
         '.']
   env:
     - 'DOCKER_BUILDKIT=1'
+
 # Push the image to Artifact Registry
 - name: 'gcr.io/cloud-builders/docker'
   args: ['push', 'europe-west1-docker.pkg.dev/$PROJECT_ID/mindfulness/maya1-fastapi:latest']
+
 # Deploy image to Cloud Run
 - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
   entrypoint: gcloud
@@ -29,8 +31,13 @@ steps:
     '--max-instances', '1',
     '--port', '8000',
     '--allow-unauthenticated',
-    '--set-env-vars', 'MAYA1_MODEL_PATH=./local_model,SNAC_MODEL_PATH=./local_snac,PYTORCH_ALLOC_CONF=expandable_segments:True,LOG_LEVEL=debug'
+    # --- VOLUME CONFIGURATION START ---
+    '--add-volume', 'name=maya1-awq,type=cloud-storage,bucket=maya1-quants',
+    '--add-volume-mount', 'volume=maya1-awq,mount-path=/mnt/maya1',
+    # --- VOLUME CONFIGURATION END ---
+    '--set-env-vars', 'MAYA1_MODEL_PATH=/mnt/maya1/maya1-fp8,SNAC_MODEL_PATH=./local_snac,PYTORCH_ALLOC_CONF=expandable_segments:True,LOG_LEVEL=debug'
   ]
+
 images:
 - 'europe-west1-docker.pkg.dev/$PROJECT_ID/mindfulness/maya1-fastapi:latest'
 

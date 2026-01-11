@@ -1,7 +1,7 @@
 from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from llmcompressor import oneshot
-from llmcompressor.transformers.compression.compressed_tensors_utils import modify_save_pretrained
+from llmcompressor.modifiers.quantization import QuantizationModifier
 import torch
 import json
 
@@ -76,12 +76,18 @@ def preprocess_fn(example):
 # Remove tensors from the map function
 tokenized_ds = ds.map(preprocess_fn, batched=False, remove_columns=ds.column_names)
 
+recipe = QuantizationModifier(
+    targets="Linear",
+    scheme="FP8", # Static FP8
+    ignore=["lm_head"] 
+)
+
 # Apply algorithms.
 oneshot(
     model=model,
     dataset=tokenized_ds, # Use the tokenized version
-    recipe="./recipe.yaml",
+    recipe=recipe,
     max_seq_length=MAX_SEQUENCE_LENGTH,
     num_calibration_samples=len(data), # Use all samples since the list is small
-    output_dir="maya1-awq"
+    output_dir="maya1-fp8"
 )

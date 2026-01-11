@@ -12,14 +12,14 @@ ENV HF_TOKEN=$HF_TOKEN
 
 # Use BuildKit cache mounts to persist the HF cache across builds
 # This ensures that even if the layer is invalidated, the files are already on disk
-RUN --mount=type=cache,target=/root/.cache/huggingface \
-    hf download maya-research/maya1 --local-dir ./maya1 \
-    --include "tokenizer*" \
-    --include "config.json" \
-    --include "generation_config.json"
+# RUN --mount=type=cache,target=/root/.cache/huggingface \
+#     hf download maya-research/maya1 --local-dir ./maya1 \
+#     --include "tokenizer*" \
+#     --include "config.json" \
+#     --include "generation_config.json"
 
-RUN --mount=type=cache,target=/root/.cache/huggingface \
-    hf download Mungert/maya1-GGUF --local-dir ./maya1 --include "maya1-q4_k_m.gguf"
+# RUN --mount=type=cache,target=/root/.cache/huggingface \
+#     hf download Mungert/maya1-GGUF --local-dir ./maya1 --include "maya1-q4_k_m.gguf"
 
 RUN --mount=type=cache,target=/root/.cache/huggingface \
     hf download hubertsiuzdak/snac_24khz --local-dir ./snac
@@ -53,7 +53,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir -r requirements.txt google-cloud-logging
 
 # 5. Copy model artifacts (Large but static)
-COPY --from=downloader /models/maya1 ./local_model
+# COPY --from=downloader /models/maya1 ./local_model
 COPY --from=downloader /models/snac ./local_snac
 
 # 6. Copy application code (Changes frequently)

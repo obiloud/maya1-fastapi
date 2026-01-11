@@ -9,11 +9,7 @@ from vllm import AsyncLLMEngine, AsyncEngineArgs, SamplingParams
 import logging
 import time 
 import asyncio
-from .constants import (
-    ALL_EMOTION_TAGS,
-    DEFAULT_MAX_MODEL_LEN,
-    SOH_ID, EOH_ID, SOA_ID, BOS_ID, TEXT_EOT_ID, CODE_START_TOKEN_ID,
-)
+from .constants import DEFAULT_MAX_MODEL_LEN
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +21,7 @@ class Maya1Model:
         model_path: str = None,
         dtype: str = "bfloat16",
         max_model_len: int = DEFAULT_MAX_MODEL_LEN,
-        gpu_memory_utilization: float = 0.8,
+        gpu_memory_utilization: float = 0.85,
         tensor_parallel_size: int = 1,
         **engine_kwargs
     ):
@@ -52,35 +48,18 @@ class Maya1Model:
         logger.info(f"Initializing Maya1 Model")
         logger.debug(f"Model: {model_path}")
         
-        trust_remote_code=True
-        if './' in model_path:
-            # local path
-            trust_remote_code=False
-
-        # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
-            trust_remote_code=trust_remote_code,
-        )
-        
-        logger.info(f"Tokenizer loaded: {len(self.tokenizer)} tokens")
-        
-        # Validate emotion tags
-        self._validate_emotion_tags()
-        
-        # Precompute special token strings
-        self._init_special_tokens()
-        
         # Initialize vLLM engine
         logger.info(f"Initializing vLLM engine...")
         engine_args = AsyncEngineArgs(
-            model="./local_model/maya1-q4_k_m.gguf", # Path to the specific file
-            tokenizer="./local_model",              # Path to directory containing tokenizer.json
-            quantization="gguf",                    # Required for GGUF loading
-            kv_cache_dtype="fp8",                   # Keep this for extra memory efficiency
-            enforce_eager=True,                    # Disable eager to allow CUDA Graph optimization
-            gpu_memory_utilization=0.9,
-            max_model_len=4096,
+            model=model_path,
+            dtype=dtype,
+            kv_cache_dtype="fp8",
+            enforce_eager=False,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
+            max_num_seqs=1,
+            tensor_parallel_size=tensor_parallel_size,
+            enable_chunked_prefill=True,
             **engine_kwargs
         )
         
@@ -88,31 +67,8 @@ class Maya1Model:
         
         logger.info(f"Maya1 Model ready\n")
     
-    def _validate_emotion_tags(self):
-        """Validate that all 20 emotion tags are single tokens."""
-        failed_tags = []
-        for tag in ALL_EMOTION_TAGS:
-            token_ids = self.tokenizer.encode(tag, add_special_tokens=False)
-            if len(token_ids) != 1:
-                failed_tags.append((tag, len(token_ids)))
-        
-        if failed_tags:
-            logger.error(f"ERROR: {len(failed_tags)} emotion tags are NOT single tokens!")
-            raise AssertionError(f"Emotion tags validation failed")
-        
-        logger.info(f"All {len(ALL_EMOTION_TAGS)} emotion tags validated")
-    
-    def _init_special_tokens(self):
-        """Precompute special token strings ensuring no hidden prefix/suffix."""
-        def clean_decode(token_id):
-            return self.tokenizer.decode([token_id]).strip()
-
-        self.soh_token = clean_decode(SOH_ID)
-        self.bos_token = self.tokenizer.bos_token or ""
-        self.eot_token = clean_decode(TEXT_EOT_ID)
-        self.eoh_token = clean_decode(EOH_ID)
-        self.soa_token = clean_decode(SOA_ID)
-        self.sos_token = clean_decode(CODE_START_TOKEN_ID)
+    async def get_tokenizer(self):
+        return await self.engine.get_tokenizer()
     
     async def get_engine_health_status(self):
         """Directly inspect the vLLM scheduler state."""
@@ -131,7 +87,7 @@ class Maya1Model:
             "cpu_cache_usage": stats.cpu_cache_usage,
         }
 
-    async def generate(self, prompt: str, sampling_params: SamplingParams):
+    async def generate(self, prompt, sampling_params: SamplingParams):
         """
         Generate tokens from prompt (non-streaming).
         Args:
@@ -168,7 +124,7 @@ class Maya1Model:
             logger.error(f"❌ [vLLM {request_id}] Error during generation: {e}")
             raise
 
-    async def generate_stream(self, prompt: str, sampling_params: SamplingParams):
+    async def generate_stream(self, prompt, sampling_params: SamplingParams):
         """
         Generate tokens from prompt (streaming).
         Args:

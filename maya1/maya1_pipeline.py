@@ -2,7 +2,6 @@ import re
 import logging
 from typing import AsyncGenerator, Optional, List, Dict, Any
 from vllm import SamplingParams
-import numpy as np
 from .utils import recursive_word_chunker, parse_pause_tags, generate_silent_bytes
 import asyncio
 from dataclasses import dataclass
@@ -18,15 +17,12 @@ from .constants import (
     CODE_END_TOKEN_ID,
     SNAC_MIN_ID,
     SNAC_MAX_ID,
-    SOA_ID,
-    SOH_ID,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     DEFAULT_MAX_TOKENS,
     DEFAULT_MIN_TOKENS,
     DEFAULT_REPETITION_PENALTY,
-    DEFAULT_SEED,
-    MAX_WORDS_PER_CHUNK,
+    MAX_WORDS_PER_CHUNK
 )
 
 RATE = 2400
@@ -73,6 +69,18 @@ class Maya1Pipeline:
             initargs=(snac_decoder_class, decoder_kwargs)
         )
         self.decode_lock = asyncio.Lock()
+
+        # Create a dictionary of all text tokens (0 to 128256) 
+        # and give them a massive negative bias.
+        text_tokens_to_block = {i: -100.0 for i in range(128266)}
+
+        # Remove the audio-specific tokens from the block list 
+        # so the model CAN generate them.
+        for audio_id in [CODE_START_TOKEN_ID, CODE_END_TOKEN_ID]:
+            if audio_id in text_tokens_to_block:
+                del text_tokens_to_block[audio_id]
+        
+        self.text_tokens_to_block = text_tokens_to_block
         
         logger.info("Pipeline initialized")
 
@@ -289,7 +297,11 @@ class Maya1Pipeline:
                         min_tokens=kwargs.get("min_tokens", DEFAULT_MIN_TOKENS),
                         repetition_penalty=kwargs.get('repetition_penalty', DEFAULT_REPETITION_PENALTY),
                         stop_token_ids=[CODE_END_TOKEN_ID],
+                        logit_bias=self.text_tokens_to_block
                     )
+
+                    BATCH_SIZE_FRAMES = 5
+                    snac_buffer = []
                     
                     start_inference = time.perf_counter()
                     async for request_output in self.model.generate_stream(prompt, sampling_params):
@@ -315,15 +327,20 @@ class Maya1Pipeline:
                                 )
                             
                             # Log the IDs to see if they are SNAC (1000-12000) or Tags (13000+)
-                            logger.debug(f"Burst Top Tokens: {top_tokens}")
+                            # logger.debug(f"Burst Top Tokens: {top_tokens}")
 
                         # Extract codes (handles alignment and SOS/EOS)
                         snac_codes, raw_consumed = self._extract_snac_codes_streaming(new_tokens)
-                        
-                        # We need at least 7 tokens for a single SNAC frame
-                        if len(snac_codes) >= 7:
-                            await decode_queue.put((i, item, snac_codes))
-                            logger.debug(f"📦 {len(snac_codes)} SNAC codes handed off.")
+
+                        if snac_codes:
+                            snac_buffer.extend(snac_codes)
+                            
+                            # Yield only when we have reached our batch threshold
+                            # (BATCH_SIZE_FRAMES * 7 tokens per frame)
+                            if len(snac_buffer) >= (BATCH_SIZE_FRAMES * 7):
+                                await decode_queue.put((i, item, snac_buffer))
+                                logger.debug(f"📦 Batched {len(snac_buffer)//7} frames handed off.")
+                                snac_buffer = [] # Reset buffer
                                 
                         vllm_pointer += raw_consumed
                     
@@ -440,7 +457,6 @@ class Maya1Pipeline:
         max_words_per_chunk = kwargs.get('max_words_per_chunk', MAX_WORDS_PER_CHUNK)
         pipeline_items = self.prepare_pipeline(text, max_words_per_chunk)
 
-        CODE_TOKEN_OFFSET = 128266
         try:
             for i, item in enumerate(pipeline_items):
                 if item.type == 'pause':
@@ -460,6 +476,7 @@ class Maya1Pipeline:
                     repetition_penalty=kwargs.get('repetition_penalty', DEFAULT_REPETITION_PENALTY),
                     stop_token_ids=[CODE_END_TOKEN_ID],
                     ignore_eos=False,
+                    logit_bias=self.text_tokens_to_block
                 )
 
                 start_inference = time.perf_counter()
@@ -467,6 +484,8 @@ class Maya1Pipeline:
                 vllm_pointer = 0
                 snac_frame_accumulator = [] 
                 CODE_TOKEN_OFFSET = 128266
+                BATCH_SIZE_FRAMES = 5  # Yield every ~425ms of audio instead of 85ms
+                frame_batch = []
 
                 async for request_output in self.model.generate_stream(prompt, sampling_params):
                     # Get only the newest tokens from vLLM
@@ -496,12 +515,15 @@ class Maya1Pipeline:
                                     (s[5] - CODE_TOKEN_OFFSET) % 4096, (s[6] - CODE_TOKEN_OFFSET) % 4096
                                 ]
                                 
-                                # Zero-latency yield
-                                yield json.dumps({"type": "tokens", "data": l1 + l2 + l3}) + "\n"
-                                
-                                logger.debug(f"📤 Sent 7 tokens (1 frame) to client.")
+                                # Add to batch instead of yielding immediately
+                                frame_batch.append(l1 + l2 + l3)
+                                snac_frame_accumulator = []
 
-                                snac_frame_accumulator = [] # Reset for next 85ms of audio
+                                # 2. Yield the batch
+                                if len(frame_batch) >= BATCH_SIZE_FRAMES:
+                                    yield json.dumps({"type": "tokens", "data": frame_batch}) + "\n"
+                                    logger.debug(f"📤 Sent {BATCH_SIZE_FRAMES * 7} tokens ({BATCH_SIZE_FRAMES} frames) to client.")
+                                    frame_batch = []
                         
                         elif token == CODE_END_TOKEN_ID:
                             logger.info("End of audio codes detected.")

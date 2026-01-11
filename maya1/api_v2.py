@@ -70,8 +70,9 @@ async def lifespan(app: FastAPI): # FIXED TYPO: lifspan -> lifespan
     
     # Load Model (vLLM Engine)
     model = Maya1Model() 
+    tokenizer = await model.get_tokenizer()
 
-    prompt_builder = Maya1PromptBuilder(model.tokenizer, model)
+    prompt_builder = Maya1PromptBuilder(tokenizer)
 
     streaming_pipeline = Maya1Pipeline(model, prompt_builder, SNACDecoder, device=snac_device)
 

@@ -1,24 +1,14 @@
-AWQModifier:
-  mappings:
-    - smooth_layer: "re:.*input_layernorm"
-      balance_layers: 
-        - "re:.*q_proj"
-        - "re:.*k_proj"
-        - "re:.*v_proj"
-    - smooth_layer: "re:.*post_attention_layernorm"
-      balance_layers: 
-        - "re:.*gate_proj"
-        - "re:.*up_proj"
-  ignore: ["lm_head"]
-  config_groups:
-    group_0:
-      targets:
-        - "Linear"
-      input_activations: null
-      output_activations: null
-      weights:
-        num_bits: 4
-        type: "int"
-        symmetric: false
-        strategy: "group"
-        group_size: 128
+quant_stage:
+  index: 0
+  quant_modifiers:
+    AWQModifier:
+      ignore: ["lm_head"]
+      config_groups:
+        group_0:
+          targets: ["Linear"]
+          weights:
+            num_bits: 4
+            type: "int"
+            symmetric: false
+            strategy: "group"
+            group_size: 128

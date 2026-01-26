@@ -57,7 +57,7 @@ ALL_EMOTION_TAGS = [
 # Model configuration
 DEFAULT_MODEL_PATH = "maya-research/maya1"
 DEFAULT_CHECKPOINT = "checkpoint-25000"
-DEFAULT_MAX_MODEL_LEN = 8192
+DEFAULT_MAX_MODEL_LEN = 1024 # 8192
 
 # SNAC configuration
 SNAC_MODEL_NAME = "hubertsiuzdak/snac_24khz"
@@ -73,8 +73,8 @@ AUDIO_BITS_PER_SAMPLE = 16
 # Generation defaults
 DEFAULT_TEMPERATURE = 0.4  # Lower temp for more stable generation
 DEFAULT_TOP_P = 0.9
-DEFAULT_MAX_TOKENS = 2048  # Reasonable default for most use cases
-DEFAULT_MIN_TOKENS = 28  # At least 4 SNAC frames
+DEFAULT_MAX_TOKENS = 1024 #2048  # Reasonable default for most use cases
+DEFAULT_MIN_TOKENS = 1 # 28  # At least 4 SNAC frames
 DEFAULT_REPETITION_PENALTY = 1.1
 DEFAULT_SEED = None  # None = random, set integer for reproducibility
 
@@ -93,3 +93,5 @@ DEFAULT_SEED = None  # None = random, set integer for reproducibility
 STREAM_BUFFER_SIZE = 28  # 4 frames (process every 28 tokens)
 SNAC_BATCH_SIZE = 64
 SNAC_BATCH_TIMEOUT_MS = 15
+
+MAX_WORDS_PER_CHUNK = 60

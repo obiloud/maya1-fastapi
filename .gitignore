@@ -59,3 +59,5 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+maya1/awq_quant/maya1-*
+

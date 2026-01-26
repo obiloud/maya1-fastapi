@@ -3,15 +3,18 @@ import numpy as np
 import asyncio
 from typing import List, Optional, Tuple
 from snac import SNAC
+import os
+import logging
+import time
 
 from .constants import (
     CODE_END_TOKEN_ID,
     CODE_TOKEN_OFFSET,
     SNAC_MODEL_NAME,
-    SNAC_SAMPLE_RATE,
     SNAC_TOKENS_PER_FRAME,
 )
 
+logger = logging.getLogger(__name__)
 
 class SNACDecoder:
     """
@@ -45,11 +48,21 @@ class SNACDecoder:
         self.max_batch_size = max_batch_size
         self.batch_timeout_ms = batch_timeout_ms
         
-        print(f"Loading SNAC 24kHz model to {device}...")
-        self.snac_model = SNAC.from_pretrained(SNAC_MODEL_NAME).eval().to(device)
-        
+        snac_model = os.environ.get('SNAC_MODEL_PATH', SNAC_MODEL_NAME)
+
+        logger.info(f"Loading SNAC 24kHz model to {device}...")
+        self.snac_model = SNAC.from_pretrained(snac_model).eval().to(device)
+
+        if device == "cpu":
+            torch.set_num_threads(4)
+            torch.set_num_interop_threads(2)
+            torch.set_grad_enabled(False)
+
+            if hasattr(torch, 'set_flush_denormal'):
+                torch.set_flush_denormal(True)
+            
         if compile_decoder:
-            print(f"Compiling SNAC decoder with torch.compile...")
+            logger.info(f"Compiling SNAC decoder with torch.compile...")
             self._compile_model()
         
         # Batching infrastructure
@@ -57,9 +70,9 @@ class SNACDecoder:
             self.request_queue = asyncio.Queue()
             self.batch_processor_task = None
             self._running = False
-            print(f"Batching enabled (max_batch={max_batch_size}, timeout={batch_timeout_ms}ms)")
+            logger.info(f"Batching enabled (max_batch={max_batch_size}, timeout={batch_timeout_ms}ms)")
         
-        print(f"SNAC decoder initialized")
+        logger.info(f"SNAC decoder initialized")
     
     def _compile_model(self):
         """Compile SNAC decoder with torch.compile"""
@@ -84,7 +97,7 @@ class SNACDecoder:
             mode="reduce-overhead"
         )
         
-        print(f"SNAC decoder compiled")
+        logger.info(f"SNAC decoder compiled")
     
     def unpack_snac_from_7(self, vocab_ids: List[int]) -> List[List[int]]:
         """
@@ -172,7 +185,7 @@ class SNACDecoder:
             Returns None if not enough tokens
         """
         if len(snac_tokens) < SNAC_TOKENS_PER_FRAME:
-            print(f"Not enough SNAC tokens: {len(snac_tokens)} < {SNAC_TOKENS_PER_FRAME}")
+            logger.warning(f"Not enough SNAC tokens: {len(snac_tokens)} < {SNAC_TOKENS_PER_FRAME}")
             return None
         
         # Unpack to 3 levels
@@ -194,15 +207,18 @@ class SNACDecoder:
         # Extract audio (remove padding if any)
         # SNAC decoder outputs: [batch, 1, samples]
         audio = audio[0, 0].cpu().numpy()
+
+        # Inside decoder_worker or SNACDecoder
+        # logger.debug(f"🔍 Audio Stats: Len={len(audio)} | Shape={audio.shape if hasattr(audio, 'shape') else 'Bytes'}")
         
         # Sliding window mode: only keep middle 2048 samples
         # This eliminates popping/cracking when using overlapping 28-token windows
         if use_sliding_window:
+            # A 4-frame window produces 8192 samples. 
+            # Frame 0: Warmup, Frame 1: Actual, Frame 2/3: Lookahead.
+            # We crop the second frame (2048 to 4096).
             if len(audio) >= 4096:
-                audio = audio[2048:4096]  # Keep middle portion only
-            else:
-                # For shorter audio, keep everything (final chunk)
-                pass
+                audio = audio[2048:4096]
         else:
             # Standard mode: trim warm-up samples
             # Default: 2048 samples for first chunk, 0 for subsequent chunks
@@ -234,7 +250,11 @@ class SNACDecoder:
             Audio as bytes (int16 PCM, 24kHz mono)
             Returns None if decode fails
         """
+        start = time.perf_counter()
+
         audio = self.decode(snac_tokens, trim_warmup=trim_warmup, use_sliding_window=use_sliding_window)
+        
+        logger.debug(f"🧵 Threaded SNAC Decode: {len(snac_tokens)} tokens -> {time.perf_counter()-start:.3f}s")
         
         if audio is None:
             return None
@@ -254,19 +274,19 @@ class SNACDecoder:
         """
         # Check minimum length
         if len(snac_tokens) < SNAC_TOKENS_PER_FRAME:
-            print(f"Too few tokens: {len(snac_tokens)}")
+            logger.warning(f"Too few tokens: {len(snac_tokens)}")
             return False
         
         # Check divisibility by 7
         if len(snac_tokens) % SNAC_TOKENS_PER_FRAME != 0:
-            print(f"  Warning: Token count {len(snac_tokens)} not divisible by 7")
-            print(f"   Will truncate to {(len(snac_tokens) // 7) * 7}")
+            logger.warning(f"  Warning: Token count {len(snac_tokens)} not divisible by 7")
+            logger.warning(f"   Will truncate to {(len(snac_tokens) // 7) * 7}")
         
         # Check token range
         for i, token_id in enumerate(snac_tokens):
             if token_id < CODE_TOKEN_OFFSET or token_id > 156937:
-                print(f" Invalid token at position {i}: {token_id}")
-                print(f"   Expected range: [{CODE_TOKEN_OFFSET}, 156937]")
+                logger.warning(f" Invalid token at position {i}: {token_id}")
+                logger.warning(f"   Expected range: [{CODE_TOKEN_OFFSET}, 156937]")
                 return False
         
         return True
@@ -284,12 +304,12 @@ class SNACDecoder:
             return
         
         if self._running:
-            print("Batch processor already running")
+            logger.warning("Batch processor already running")
             return
         
         self._running = True
         self.batch_processor_task = asyncio.create_task(self._batch_processor_loop())
-        print("Batch processor started")
+        logger.info("Batch processor started")
     
     async def stop_batch_processor(self):
         """Stop the background batch processor task."""
@@ -308,7 +328,7 @@ class SNACDecoder:
             except asyncio.CancelledError:
                 pass
         
-        print("Batch processor stopped")
+        logger.info("Batch processor stopped")
     
     async def decode_single_async(
         self, 
@@ -329,9 +349,18 @@ class SNACDecoder:
         Returns:
             Audio bytes or None if decode fails
         """
+        if not snac_tokens:
+            return None
+        
         if not self.enable_batching:
-            # Fallback to synchronous decode
-            return self.decode_to_bytes(snac_tokens, trim_warmup=trim_warmup, use_sliding_window=use_sliding_window)
+            # We use asyncio.to_thread (Python 3.9+) to run the blocking 
+            # decode_to_bytes method without stopping the watchdog.
+            return await asyncio.to_thread(
+                self.decode_to_bytes,
+                snac_tokens,
+                trim_warmup=trim_warmup,
+                use_sliding_window=use_sliding_window
+            )
         
         # Create future for result
         result_future = asyncio.Future()
@@ -358,7 +387,7 @@ class SNACDecoder:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"Batch processor error: {e}")
+                logger.error(f"Batch processor error: {e}")
                 import traceback
                 traceback.print_exc()
     
